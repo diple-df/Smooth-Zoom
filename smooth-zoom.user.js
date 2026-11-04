@@ -1,14 +1,15 @@
 // ==UserScript==
 // @name         Smooth Zoom to Cursor
-// @name:ru      Плавный зум к курсору
 // @namespace    https://github.com/diple-df/Smooth-Zoom
-// @version      2.6.2
-// @description  Trackpad-style smooth zoom to the cursor (Ctrl+Wheel). Compositor-driven CSS transition: stays smooth even on heavy pages. Crisp at rest, keeps fixed elements. Native Ctrl +/- left intact.
-// @description:ru Плавный зум к курсору (Ctrl+колесо). Анимация на композиторе через CSS transition: остаётся плавной даже на тяжёлых страницах. Чётко в покое, fixed не пропадают. Родной зум Ctrl +/- не трогается.
+// @version      2.7.0
+// @description  Trackpad-style smooth zoom to the cursor (Ctrl+Wheel). Compositor-driven CSS transition: stays smooth even on heavy pages. Crisp at rest, keeps fixed elements. Native Ctrl +/- left intact. Configurable via menu.
+// @description:ru Плавный зум к курсору (Ctrl+колесо). Анимация на композиторе через CSS transition: остаётся плавной даже на тяжёлых страницах. Чётко в покое, fixed не пропадают. Родной зум Ctrl +/- не трогается. Настраивается через меню.
 // @author       diple_df x claude
 // @match        *://*/*
 // @run-at       document-start
-// @grant        none
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_registerMenuCommand
 // @downloadURL  https://raw.githubusercontent.com/diple-df/Smooth-Zoom/main/smooth-zoom.user.js
 // @updateURL    https://raw.githubusercontent.com/diple-df/Smooth-Zoom/main/smooth-zoom.user.js
 // @noframes
@@ -18,14 +19,35 @@
     'use strict';
 
     // ----- Настройки -----------------------------------------------------
-    const CONFIG = {
-        minScale: 1,         // минимальный масштаб (1 = реальный размер)
-        maxScale: 10,        // максимальный масштаб
-        wheelStep: 0.0015,   // чувствительность колеса при зуме
-        panSpeed: 1,         // скорость прокрутки по увеличенной странице
-        transitionMs: 120,   // длительность плавной доводки масштаба (на GPU)
-        crispDelayMs: 200,   // через сколько после остановки перерисовать чётко
+    const DEFAULT_CFG = {
+        minScale: 1,
+        maxScale: 10,
+        wheelStep: 0.0015,
+        panSpeed: 1,
+        transitionMs: 120,
+        crispDelayMs: 200,
     };
+    let CONFIG = Object.assign({}, DEFAULT_CFG);
+    try {
+        if (typeof GM_getValue === 'function') {
+            const s = GM_getValue('smoothzoom_cfg', null);
+            if (s) CONFIG = Object.assign({}, DEFAULT_CFG, JSON.parse(s));
+        }
+    } catch(e) {}
+
+    function saveCfg(){
+        try {
+            if (typeof GM_setValue === 'function') GM_setValue('smoothzoom_cfg', JSON.stringify(CONFIG));
+        } catch(e){}
+    }
+
+    if (typeof GM_registerMenuCommand === 'function') {
+        GM_registerMenuCommand('Smooth Zoom: Сбросить настройки', function(){
+            CONFIG = Object.assign({}, DEFAULT_CFG);
+            saveCfg();
+            location.reload();
+        });
+    }
 
     // ----- Состояние -----------------------------------------------------
     // Зум = transform: translate(tx,ty) scale(scale) на <html>, origin 0,0.
@@ -212,7 +234,6 @@
         if (!el) return;
         try {
             el.style.transition = animate ? `transform ${CONFIG.transitionMs}ms ease-out` : 'transform 0s';
-            // Используем округление для меньшего количества перерисовок
             el.style.transform =
                 `translate(${tx.toFixed(2)}px, ${ty.toFixed(2)}px) scale(${scale.toFixed(4)})`;
         } catch (e) {
@@ -413,7 +434,9 @@
                     deltaX *= viewW || window.innerWidth || 800;
                     deltaY *= viewH || window.innerHeight || 600;
                 }
-                if (e.shiftKey && Math.abs(deltaX) < 0.0001) {
+                if (e.shiftKey && CONFIG.shiftWheelHorizontal) {
+                    panBy(-deltaY * CONFIG.panSpeed, 0);
+                } else if (e.shiftKey && Math.abs(deltaX) < 0.0001) {
                     panBy(-deltaY * CONFIG.panSpeed, 0);
                 } else {
                     panBy(-deltaX * CONFIG.panSpeed, -deltaY * CONFIG.panSpeed);
