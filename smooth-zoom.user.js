@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Smooth Zoom to Cursor
 // @namespace    https://github.com/diple-df/Smooth-Zoom
-// @version      2.14.0
+// @version      2.15.0
 // @description  Trackpad-style smooth zoom to the cursor (Ctrl+Wheel). Compositor-driven CSS transition, at most one transform write per frame, zero work while idle. Crisp at rest, keeps fixed elements. Native Ctrl +/- left intact. Configurable via menu.
 // @description:ru Плавный зум к курсору (Ctrl+колесо). Анимация на композиторе, не больше одной записи transform за кадр, в простое скрипт не делает ничего. Чётко в покое, fixed не пропадают. Родной зум Ctrl +/- не трогается. Настраивается через меню.
 // @author       diple_df x claude
@@ -381,11 +381,15 @@
         } catch (e) {
             return;
         }
-        if (!cs || cs.position !== 'fixed') return;
+        if (!cs) return;
+        const isAbs = cs.position === 'absolute';
+        if (cs.position !== 'fixed' && !isAbs) return;
         // Содержащий блок не вьюпорт — элемент уже живёт в своём контексте
         // и масштабируется вместе с ним. Замерено: попытка компенсировать
         // такой узел давала промах до 784 px по вертикали.
         if (hasTransformAncestor(el)) return;
+        // Для absolute решение принимается ниже, когда уже есть rect.
+        let overlayAbs = false;
         // position: sticky сознательно не конвертируем: absolute вырвал бы
         // элемент из потока, и контент под ним прыгнул бы вверх. Sticky сам
         // держится своей позиции в потоке, а скролл у нас всё равно 0.
@@ -399,6 +403,10 @@
         // получили бы 0x0 и сломали элемент, когда его покажут. Если он
         // появится позже, это поймает наблюдатель (класс/скрытость).
         if (!rect.width && !rect.height) return;
+        if (isAbs) {
+            overlayAbs = isViewportOverlay(el, cs, rect);
+            if (!overlayAbs) return;
+        }
         // transform-origin в px от левого верхнего угла border-box.
         const toks = String(cs.transformOrigin || '').split(' ');
         let tox = parseFloat(toks[0]), toy = parseFloat(toks[1]);
@@ -439,6 +447,12 @@
             top: (rect.top - originY - convTy) * inv,
             w: w,
             h: h,
+            kind: overlayAbs ? 'abs' : 'fixed',
+            // Растянут сверху и снизу одновременно (inset:0, top:0;bottom:0).
+            // У таких высоту задаёт пара top/bottom, а мы её снимаем — без
+            // явного height элемент схлопнулся бы: замерено, маска ушла с
+            // 800 px до 0. Поэтому высоту для них фиксируем всегда.
+            stretchedV: cs.top !== 'auto' && cs.bottom !== 'auto',
             borderBox: cs.boxSizing === 'border-box',
             pl: parseFloat(cs.paddingLeft) || 0,
             pr: parseFloat(cs.paddingRight) || 0,
@@ -449,6 +463,50 @@
             bt: parseFloat(cs.borderTopWidth) || 0,
             bb: parseFloat(cs.borderBottomWidth) || 0
         });
+    }
+
+    // Абсолютный элемент без positioned-предка (offsetParent === null) считается
+    // от initial containing block, то есть от вьюпорта: `inset:0` даёт маску на
+    // весь экран, а left:calc(100% - 302px) — панель у правого края. Под корневым
+    // transform такой оверлей масштабируется вместе с документом: маска на
+    // DDG раздувалась с 1280x800 до 2103x1315 и уезжала в -411,-257, а боковая
+    // панель уползала за правый край. Это и есть «лишние элементы при зуме».
+    // In-document декор (position:relative у предка) сюда не попадает: у него
+    // offsetParent не null.
+    let _bodyStatic = null;
+    function bodyIsStatic() {
+        if (_bodyStatic === null) {
+            try { _bodyStatic = getComputedStyle(document.body).position === 'static'; }
+            catch (e) { _bodyStatic = true; }
+        }
+        return _bodyStatic;
+    }
+
+    function isViewportOverlay(el, cs, rect) {
+        if (cs.position !== 'absolute') return false;
+        if (el === document.documentElement || el === document.body) return false;
+        // Содержащий блок — вьюпорт, если positioned-предка нет. Браузер
+        // отдаёт для такого случая offsetParent === body (а не null, как можно
+        // было бы ожидать), поэтому проверяем оба варианта. Замерено на
+        // фикстуре abs2.html: без этой поправки маска и боковая панель
+        // оставались некомпенсированными и раздувались вместе с документом.
+        const op = el.offsetParent;
+        if (op !== null && !(op === document.body && bodyIsStatic())) return false;
+        const vw = viewW > 0 ? viewW : innerWidth;
+        const vh = viewH > 0 ? viewH : innerHeight;
+        if (!vw || !vh) return false;
+        // Полноэкранная маска/подложка.
+        if (rect.width >= vw * 0.8 && rect.height >= vh * 0.8) return true;
+        // Прижата к любому краю вьюпорта: панели, доки, панели фильтров.
+        const eps = 2;
+        if (rect.left <= eps || rect.top <= eps ||
+            rect.right >= vw - eps || rect.bottom >= vh - eps) return true;
+        // Отцентрована по вьюпорту: диалоги и тосты с left/top:50%.
+        const cx = rect.left + rect.width / 2;
+        const cy = rect.top + rect.height / 2;
+        if (Math.abs(cx - vw / 2) <= vw * 0.03 &&
+            Math.abs(cy - vh / 2) <= vh * 0.03) return true;
+        return false;
     }
 
     // position:fixed внутри предка с transform/filter/contain/will-change уже
@@ -551,11 +609,17 @@
                     mx: f.mx || 0,
                     my: f.my || 0,
                     w: f.w,
-                    h: f.h
+                    h: f.h,
+                    stretchedV: !!f.stretchedV
                 };
                 savedFixed.push(rec);
                 f.rec = rec;
                 converted.add(el);
+                // Absolute-оверлей оставляем absolute: сам containing block уже
+                // вьюпорт, менять position не нужно и вредно (fixed вырвал бы
+                // элемент из его контекста наложения). Компенсация — те же
+                // left/top/zoom, что и у fixed.
+                rec.kind = f.kind || 'fixed';
                 // right/bottom привязки снимаем: иначе элемент, закреплённый
                 // справа, будет расти влево и уползёт.
                 setImp(el, 'right', 'auto');
@@ -569,9 +633,10 @@
                 // border-box, чтобы f.w (внешний размер) записался как есть.
                 setImp(el, 'box-sizing', 'border-box');
                 setImp(el, 'width', f.w + 'px');
-                // Высоту — только когда она была задана явно: у auto-высоты
-                // содержимое может вырасти и его нельзя обрезать.
-                if (f.borderBox) setImp(el, 'height', f.h + 'px');
+                // Высоту — когда она задана явно или когда её задавала пара
+                // top/bottom, которую мы только что сняли. У остальных
+                // auto-высоты содержимое может вырасти, и обрезать его нельзя.
+                if (f.borderBox || f.stretchedV) setImp(el, 'height', f.h + 'px');
             } catch (e) {
                 // пропускаем
             }

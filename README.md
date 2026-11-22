@@ -84,6 +84,14 @@ The scan now walks every reachable open shadow root up to six levels deep and co
 
 A fixed element stretched by `left`/`right` has no intrinsic width. Clearing `right` used to leave width on `auto`, so the browser collapsed the element to its content — a full-width header measured `1265 → 224` px. Width is now pinned in pixels for every compensated element.
 
+### Absolute overlays pinned to the viewport
+
+Not every overlay is `position:fixed`. Dialogs, modal masks, side panels and toasts are often plain `position:absolute` elements with no positioned ancestor, which makes the viewport their containing block. Under the page transform they scaled with the document: measured on DuckDuckGo, a full-screen mask grew from 1280×800 to 2103×1315 and slid to −411,−257, and a right-edge panel moved off-screen entirely.
+
+Such an element is now detected (no positioned ancestor, and it either covers most of the viewport, touches one of its edges, or is centred in it) and compensated the same way as a fixed one. Elements that only look similar — decorative boxes positioned relative to an article — keep their parent and scale with the content, because the check requires the containing block to actually be the viewport.
+
+Measured on a fixture with four overlays at 164%: mask, side panel, centred modal and an off-screen tooltip all end at `dl = dt = dw = dh = 0`, while the article around them scales by 1.643 as it should.
+
 ### Scroll lock
 
 While zoomed, the root element gets `overflow: hidden` and `scrollbar-gutter: stable`. Without that, the enlarged transform box adds area to the root's scrollable overflow. On sites that set `overflow: auto` on `<html>` — DuckDuckGo, for one — this spawns a horizontal scrollbar, which takes 15 px off `clientWidth`, which fires `resize`, which relayouts the page, which removes the scrollbar again. The result was visible flicker and content sliding off to the left. Reserving the scrollbar gutter keeps the viewport width identical before and after the zoom, so nothing reflows and the cursor anchor stays exact. Both properties are restored on zoom-out.
