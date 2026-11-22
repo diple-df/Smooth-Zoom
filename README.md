@@ -107,8 +107,8 @@ Key parameters can be adjusted in the script:
 
 At most one `transform` write per animation frame, and effectively no work while
 idle: no animation loop, no timers, no layout reads in input handlers, and
-`will-change` is dropped as soon as the zoom settles. See [PERF.md](PERF.md) for
-the full workload model and the list of handled edge cases.
+`will-change` is dropped as soon as the zoom settles. Measured in headless Edge:
+zero animation-frame requests during a one-second idle window.
 
 ### Known limitations
 
