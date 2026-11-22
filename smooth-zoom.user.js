@@ -1,15 +1,20 @@
 // ==UserScript==
 // @name         Smooth Zoom to Cursor
 // @namespace    https://github.com/diple-df/Smooth-Zoom
-// @version      2.8.1
+// @version      2.9.0
 // @description  Trackpad-style smooth zoom to the cursor (Ctrl+Wheel). Compositor-driven CSS transition, at most one transform write per frame, zero work while idle. Crisp at rest, keeps fixed elements. Native Ctrl +/- left intact. Configurable via menu.
 // @description:ru Плавный зум к курсору (Ctrl+колесо). Анимация на композиторе, не больше одной записи transform за кадр, в простое скрипт не делает ничего. Чётко в покое, fixed не пропадают. Родной зум Ctrl +/- не трогается. Настраивается через меню.
 // @author       diple_df x claude
+// @homepageURL  https://github.com/diple-df/Smooth-Zoom
+// @supportURL   https://github.com/diple-df/Smooth-Zoom/issues
 // @match        *://*/*
 // @run-at       document-start
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_registerMenuCommand
+// @grant        GM_xmlhttpRequest
+// @connect      raw.githubusercontent.com
+// @connect      github.com
 // @downloadURL  https://raw.githubusercontent.com/diple-df/Smooth-Zoom/main/smooth-zoom.user.js
 // @updateURL    https://raw.githubusercontent.com/diple-df/Smooth-Zoom/main/smooth-zoom.user.js
 // @noframes
@@ -46,6 +51,157 @@
             if (typeof GM_setValue === 'function') GM_setValue('smoothzoom_cfg', JSON.stringify(CONFIG));
         } catch(e){}
     }
+
+    // ----- Автообновление -------------------------------------------------
+    // Пассивная часть — @updateURL/@downloadURL в шапке: Tampermonkey сам
+    // сверяет версию. Здесь активная: проверка по запросу из меню и раз в
+    // сутки фоном, с баннером «доступна новая версия».
+    // Скрипт висит на *://*/*, поэтому проверка обязана быть почти бесплатной:
+    // на старте читается один timestamp, сеть трогается не чаще раза в сутки
+    // и только после загрузки страницы.
+    const UPDATE = (function () {
+        const RAW = 'https://raw.githubusercontent.com/diple-df/Smooth-Zoom/main/smooth-zoom.user.js';
+        const PAGE = 'https://github.com/diple-df/Smooth-Zoom';
+        const STAMP_KEY = 'smoothzoom_upd_ts';
+        const SEEN_KEY = 'smoothzoom_upd_seen';
+        const DAY = 86400000;
+
+        function curVer() {
+            try {
+                if (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version)
+                    return String(GM_info.script.version);
+            } catch (e) {}
+            return '2.9.0';
+        }
+
+        // Сравнение по числовым сегментам: 2.10.0 больше 2.9.0 (строкой — нет).
+        function cmp(a, b) {
+            const pa = String(a).split(/[.\-+]/), pb = String(b).split(/[.\-+]/);
+            const n = Math.max(pa.length, pb.length);
+            for (let i = 0; i < n; i++) {
+                const x = parseInt(pa[i], 10) || 0, y = parseInt(pb[i], 10) || 0;
+                if (x !== y) return x > y ? 1 : -1;
+            }
+            return 0;
+        }
+
+        function fetchText(url, cb) {
+            let done = false;
+            const finish = (txt) => { if (!done) { done = true; cb(txt || null); } };
+            try {
+                if (typeof GM_xmlhttpRequest === 'function') {
+                    GM_xmlhttpRequest({
+                        method: 'GET', url: url, timeout: 15000,
+                        onload: r => finish(r && r.status === 200 ? r.responseText : null),
+                        onerror: () => finish(null),
+                        ontimeout: () => finish(null),
+                    });
+                    return;
+                }
+            } catch (e) {}
+            try {
+                fetch(url, { cache: 'no-store' }).then(r => r.ok ? r.text() : null)
+                    .then(finish).catch(() => finish(null));
+            } catch (e) { finish(null); }
+        }
+
+        function banner(version) {
+            if (document.getElementById('smoothzoom-upd')) return;
+            const box = document.createElement('div');
+            box.id = 'smoothzoom-upd';
+            box.setAttribute('role', 'status');
+            box.style.cssText = [
+                'position:fixed', 'z-index:2147483647', 'right:16px', 'bottom:16px',
+                'max-width:320px', 'padding:12px 14px', 'border-radius:10px',
+                'background:#16181d', 'color:#f2f3f6', 'border:1px solid #2b2e38',
+                'box-shadow:0 12px 32px -8px rgba(0,0,0,.6)',
+                'font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif',
+                'display:flex', 'gap:10px', 'align-items:flex-start',
+            ].join(';');
+
+            const txt = document.createElement('div');
+            txt.style.cssText = 'flex:1 1 auto';
+            txt.textContent = 'Smooth Zoom ' + version + ' доступна. ';
+            const link = document.createElement('a');
+            link.href = RAW;
+            link.textContent = 'Обновить';
+            link.style.cssText = 'color:#7db4ff;text-decoration:underline;cursor:pointer';
+            txt.appendChild(link);
+
+            const close = document.createElement('button');
+            close.type = 'button';
+            close.textContent = '✕';
+            close.setAttribute('aria-label', 'Закрыть');
+            close.style.cssText = 'appearance:none;border:0;background:none;color:#8b90a0;' +
+                'font:inherit;cursor:pointer;padding:0 0 0 4px;line-height:1';
+            close.onclick = () => box.remove();
+
+            box.appendChild(txt);
+            box.appendChild(close);
+            (document.body || document.documentElement).appendChild(box);
+
+            try {
+                if (typeof GM_setValue === 'function') GM_setValue(SEEN_KEY, version);
+            } catch (e) {}
+        }
+
+        function check(opts) {
+            const manual = !!(opts && opts.manual);
+            try {
+                if (typeof GM_setValue === 'function') GM_setValue(STAMP_KEY, Date.now());
+            } catch (e) {}
+            fetchText(RAW, txt => {
+                if (!txt) { if (manual) menuMsg('Не удалось проверить обновления'); return; }
+                const m = txt.match(/^\/\/\s*@version\s+(.+)$/m);
+                const remote = m ? m[1].trim() : '';
+                if (!remote) { if (manual) menuMsg('Не удалось прочитать версию'); return; }
+                const local = curVer();
+                if (cmp(remote, local) > 0) {
+                    let seen = null;
+                    try { seen = typeof GM_getValue === 'function' ? GM_getValue(SEEN_KEY, null) : null; } catch (e) {}
+                    if (manual || seen !== remote) banner(remote);
+                } else if (manual) {
+                    menuMsg('Установлена последняя версия ' + local);
+                }
+            });
+        }
+
+        function menuMsg(text) {
+            // Без своего UI: короткий тост тем же баннером.
+            const box = document.createElement('div');
+            box.setAttribute('role', 'status');
+            box.style.cssText = 'position:fixed;z-index:2147483647;right:16px;bottom:16px;' +
+                'padding:10px 14px;border-radius:10px;background:#16181d;color:#f2f3f6;' +
+                'font:13px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif';
+            box.textContent = text;
+            (document.body || document.documentElement).appendChild(box);
+            setTimeout(() => box.remove(), 3200);
+        }
+
+        function maybeAuto() {
+            try {
+                if (typeof GM_getValue !== 'function') return;
+                const last = GM_getValue(STAMP_KEY, 0) || 0;
+                if (Date.now() - last < DAY) return;
+            } catch (e) { return; }
+            const run = () => check({ manual: false });
+            if ('requestIdleCallback' in window) requestIdleCallback(run, { timeout: 5000 });
+            else setTimeout(run, 2500);
+        }
+
+        return { check, maybeAuto, cmp, curVer, PAGE };
+    })();
+
+    if (typeof GM_registerMenuCommand === 'function') {
+        GM_registerMenuCommand('Smooth Zoom: Проверить обновления', function () {
+            UPDATE.check({ manual: true });
+        });
+    }
+
+    try {
+        if (document.readyState === 'complete') UPDATE.maybeAuto();
+        else window.addEventListener('load', UPDATE.maybeAuto, { once: true, passive: true });
+    } catch (e) {}
 
     if (typeof GM_registerMenuCommand === 'function') {
         GM_registerMenuCommand('Smooth Zoom: Сбросить настройки', function(){

@@ -68,7 +68,29 @@ The script applies `transform: translate() scale()` to the document root with sm
 
 ### Granted Permissions
 
-This script uses `@grant none` — no special Tampermonkey permissions required.
+The script uses two kinds of Tampermonkey storage/API grants: `GM_setValue` /
+`GM_getValue` for settings, and `GM_xmlhttpRequest` (locked to
+`raw.githubusercontent.com` / `github.com` via `@connect`) for the update check.
+No other network access happens.
+
+### Auto-update
+
+Two layers, both pointing at the same raw file in this repository:
+
+1. **Passive** — `@updateURL` / `@downloadURL` in the header. Tampermonkey
+   checks them on its own schedule and offers the update.
+2. **Active** — the script reads the remote `@version` itself:
+   - once per day, in the background, after the page has loaded (idle callback,
+     never during a zoom);
+   - on demand from the Tampermonkey menu: **Smooth Zoom: Проверить обновления**.
+
+   When the remote version is newer, a small banner appears in the corner with
+   a link to the raw script. The banner is shown once per version; a manual
+   check always shows the result, including "Установлена последняя версия".
+
+Versions are compared field by field, so `2.10.0` correctly counts as newer than
+`2.9.0` (a plain string comparison would get this wrong). The check costs one
+`localStorage` read on start-up; the network is touched at most once a day.
 
 ### Settings
 
