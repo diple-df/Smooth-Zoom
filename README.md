@@ -63,4 +63,26 @@ Key parameters can be adjusted in the script:
 - `minScale`: 1 (minimum zoom)
 - `maxScale`: 10 (maximum zoom)
 - `wheelStep`: 0.0015 (zoom sensitivity)
-- `transitionMs`: 120 (smooth transition duration)
+- `panSpeed`: 1 (wheel pan speed while zoomed)
+- `transitionMs`: 120 (zoom smoothing duration)
+- `crispDelayMs`: 200 (pause before the page is re-rasterized sharp)
+- `shiftWheelHorizontal`: false (Shift+wheel pans horizontally)
+
+### Performance
+
+At most one `transform` write per animation frame, and effectively no work while
+idle: no animation loop, no timers, no layout reads in input handlers, and
+`will-change` is dropped as soon as the zoom settles. See [PERF.md](PERF.md) for
+the full workload model and the list of handled edge cases.
+
+### Known limitations
+
+- At the very edge of a page the cursor anchor is bounded by the pan limits
+  (otherwise empty space would appear); this matches native page zoom.
+- `position: sticky` elements behave as static during zoom, because native
+  scrolling is pinned to 0 for the duration.
+- Pages that already apply `transform` or CSS `zoom` to `<html>` are left
+  untouched so the script cannot corrupt their layout.
+- Wheel input over a nested scrollable element pans the zoomed page, not that
+  element.
+
