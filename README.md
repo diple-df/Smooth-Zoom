@@ -74,6 +74,16 @@ now comes from the element's layout coordinates, which do not depend on the zoom
 any scale appears where the page intended. Elements that existed before the zoom are unaffected —
 both numbers are identical for them.
 
+### Web components and shadow DOM
+
+Sites built with custom elements keep their fixed headers, toasts and side panels inside a shadow root. `getElementsByTagName` does not descend into a shadow root, so those elements used to be skipped and simply scaled away with the page — measured drift of `-412, -257` px at 164%.
+
+The scan now walks every reachable open shadow root up to six levels deep and compensates those elements exactly like ordinary ones. Closed shadow roots stay invisible to any script and are skipped.
+
+### Fixed elements that stretch instead of staying put
+
+A fixed element stretched by `left`/`right` has no intrinsic width. Clearing `right` used to leave width on `auto`, so the browser collapsed the element to its content — a full-width header measured `1265 → 224` px. Width is now pinned in pixels for every compensated element.
+
 ### Scroll lock
 
 While zoomed, the root element gets `overflow: hidden` and `scrollbar-gutter: stable`. Without that, the enlarged transform box adds area to the root's scrollable overflow. On sites that set `overflow: auto` on `<html>` — DuckDuckGo, for one — this spawns a horizontal scrollbar, which takes 15 px off `clientWidth`, which fires `resize`, which relayouts the page, which removes the scrollbar again. The result was visible flicker and content sliding off to the left. Reserving the scrollbar gutter keeps the viewport width identical before and after the zoom, so nothing reflows and the cursor anchor stays exact. Both properties are restored on zoom-out.

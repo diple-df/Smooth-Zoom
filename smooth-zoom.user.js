@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Smooth Zoom to Cursor
 // @namespace    https://github.com/diple-df/Smooth-Zoom
-// @version      2.13.0
+// @version      2.14.0
 // @description  Trackpad-style smooth zoom to the cursor (Ctrl+Wheel). Compositor-driven CSS transition, at most one transform write per frame, zero work while idle. Crisp at rest, keeps fixed elements. Native Ctrl +/- left intact. Configurable via menu.
 // @description:ru Плавный зум к курсору (Ctrl+колесо). Анимация на композиторе, не больше одной записи transform за кадр, в простое скрипт не делает ничего. Чётко в покое, fixed не пропадают. Родной зум Ctrl +/- не трогается. Настраивается через меню.
 // @author       diple_df x claude
@@ -473,14 +473,19 @@
         return false;
     }
 
-    function collectFixed(scope, out) {
-        if (!scope || !scope.isConnected) return;
-        if (scope.nodeType === 1 && (!scope.namespaceURI || scope.namespaceURI === HTML_NS)) {
-            considerNode(scope, out);
+    // Обход одного дерева. shadowDepth ограничивает вложенность, чтобы
+    // патологическая страница не зациклила нас на собственных пересозданиях.
+    function collectTree(root, out, shadowDepth) {
+        if (!root || !root.isConnected) return;
+        if (root.nodeType === 1 && (!root.namespaceURI || root.namespaceURI === HTML_NS)) {
+            considerNode(root, out);
+            if (shadowDepth < 6) collectShadow(root, out, shadowDepth);
         }
+        // querySelectorAll, а не getElementsByTagName: у ShadowRoot
+        // последнего нет, и обход молча обрывался на первом же компоненте.
         let nodes;
         try {
-            nodes = scope.getElementsByTagName('*');
+            nodes = root.querySelectorAll('*');
         } catch (e) {
             return;
         }
@@ -489,7 +494,22 @@
             // SVG/MathML не бывают fixed — не тратим на них getComputedStyle.
             if (el.namespaceURI && el.namespaceURI !== HTML_NS) continue;
             considerNode(el, out);
+            if (shadowDepth < 6) collectShadow(el, out, shadowDepth);
         }
+    }
+
+    // getElementsByTagName не видит содержимое shadow root: веб-компоненты
+    // держат там свои fixed-шапки и тосты. Без этого прохода они просто
+    // уезжали вместе со страницей при зуме.
+    function collectShadow(host, out, shadowDepth) {
+        let sr;
+        try { sr = host.shadowRoot; } catch (e) { return; }
+        if (!sr) return; // закрытый shadow root недоступен — пропускаем
+        collectTree(sr, out, shadowDepth + 1);
+    }
+
+    function collectFixed(scope, out) {
+        collectTree(scope, out, 0);
     }
 
     const foundItems = [];
@@ -543,11 +563,15 @@
                 setImp(el, 'margin', '0');
                 // Ширину и высоту фиксируем в тех px, что были: процентные и
                 // calc() размеры считаются от изменившегося контейнера.
-                if (f.borderBox) {
-                    setImp(el, 'box-sizing', 'border-box');
-                    setImp(el, 'width', f.w + 'px');
-                    setImp(el, 'height', f.h + 'px');
-                }
+                // Ширину фиксируем ВСЕГДА: right снят, значит ширину больше
+                // ничто не задаёт, и auto схлопнул бы элемент по содержимому
+                // (замерено: шапка 1265 -> 224 px). box-sizing переводим в
+                // border-box, чтобы f.w (внешний размер) записался как есть.
+                setImp(el, 'box-sizing', 'border-box');
+                setImp(el, 'width', f.w + 'px');
+                // Высоту — только когда она была задана явно: у auto-высоты
+                // содержимое может вырасти и его нельзя обрезать.
+                if (f.borderBox) setImp(el, 'height', f.h + 'px');
             } catch (e) {
                 // пропускаем
             }
