@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Smooth Zoom to Cursor
 // @namespace    https://github.com/diple-df/Smooth-Zoom
-// @version      2.12.0
+// @version      2.13.0
 // @description  Trackpad-style smooth zoom to the cursor (Ctrl+Wheel). Compositor-driven CSS transition, at most one transform write per frame, zero work while idle. Crisp at rest, keeps fixed elements. Native Ctrl +/- left intact. Configurable via menu.
 // @description:ru Плавный зум к курсору (Ctrl+колесо). Анимация на композиторе, не больше одной записи transform за кадр, в простое скрипт не делает ничего. Чётко в покое, fixed не пропадают. Родной зум Ctrl +/- не трогается. Настраивается через меню.
 // @author       diple_df x claude
@@ -515,8 +515,16 @@
                     style: grabStyle(el, FIXED_PROPS),
                     // Экранная позиция на масштабе 1 — цель, к которой элемент
                     // обязан вернуться после любого зума.
-                    bx: f.rect.left,
-                    by: f.rect.top,
+                    //
+                    // ВАЖНО: берём её из local-координат (f.left/f.top), а не
+                    // из f.rect.left. Для элементов, которые были на странице
+                    // при входе в зум, это одно и то же число. А элемент,
+                    // ПОЯВИВШИЙСЯ уже во время зума (модалка, тост, меню),
+                    // отдаёт rect, уже сдвинутый корневым transform: при
+                    // масштабе 1.39 модалка уезжала на -251,-157 px, то есть
+                    // целиком за экран. Это и есть «лишние элементы при зуме».
+                    bx: f.left + originX,
+                    by: f.top + originY,
                     // Вклад собственного transform элемента: посчитан в
                     // considerNode() как rect.left - computed left. Оба числа
                     // уже прочитаны, поэтому лишнего reflow нет.
