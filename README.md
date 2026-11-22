@@ -50,14 +50,20 @@ Hold **Ctrl** and scroll the mouse wheel to smoothly zoom in/out to the cursor p
 - **Smooth zoom to cursor** — Zoom is anchored to your mouse position, just like trackpad pinch-to-zoom
 - **GPU-accelerated transitions** — Uses CSS transforms with compositor-driven animations for silky smoothness
 - **Works on heavy pages** — Stays responsive even on complex sites
-- **Preserves fixed elements** — Fixed/sticky elements are handled correctly during zoom
+- **Preserves fixed elements** — Fixed elements keep their exact screen position and size at any zoom level
 - **Native zoom intact** — Ctrl + / - keyboard zoom is not affected
 - **Smart panning** — When zoomed in, mouse wheel scrolls the zoomed viewport
 - **Auto-return** — Zooms back to normal when scale returns to 1
 
 ## How It Works
 
-The script applies `transform: translate() scale()` to the document root with smooth CSS transitions, converts fixed-position elements to absolute positioning during zoom to prevent rendering issues, and handles panning by adjusting the transform offset.
+The script applies `transform: translate() scale()` to the document root with smooth CSS transitions and handles panning by adjusting the transform offset.
+
+`position: fixed` elements do not follow an ancestor transform for their layout offset but they do obey `zoom`, so each one is pinned with `zoom: 1/scale` and repositioned as `left = target - tx`. That keeps headers, modals and floating buttons exactly where they were instead of stretching with the page, and the element's own `transform` (`translate(-50%, -50%)` centring, `scale`, rotate animations) is never overwritten.
+
+Elements whose containing block is not the viewport — a `fixed` node inside an ancestor with `transform`, `filter`, `contain` or `will-change` — are deliberately left alone, because they already scale together with that ancestor. Compensating them used to throw them up to ~780 px off screen.
+
+`position: sticky` is intentionally not compensated: it lives in the normal flow and must grow with the page like any other content.
 
 ## Technical Details
 

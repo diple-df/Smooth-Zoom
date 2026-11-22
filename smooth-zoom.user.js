@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Smooth Zoom to Cursor
 // @namespace    https://github.com/diple-df/Smooth-Zoom
-// @version      2.10.0
+// @version      2.11.0
 // @description  Trackpad-style smooth zoom to the cursor (Ctrl+Wheel). Compositor-driven CSS transition, at most one transform write per frame, zero work while idle. Crisp at rest, keeps fixed elements. Native Ctrl +/- left intact. Configurable via menu.
 // @description:ru Плавный зум к курсору (Ctrl+колесо). Анимация на композиторе, не больше одной записи transform за кадр, в простое скрипт не делает ничего. Чётко в покое, fixed не пропадают. Родной зум Ctrl +/- не трогается. Настраивается через меню.
 // @author       diple_df x claude
@@ -381,6 +381,10 @@
             return;
         }
         if (!cs || cs.position !== 'fixed') return;
+        // Содержащий блок не вьюпорт — элемент уже живёт в своём контексте
+        // и масштабируется вместе с ним. Замерено: попытка компенсировать
+        // такой узел давала промах до 784 px по вертикали.
+        if (hasTransformAncestor(el)) return;
         // position: sticky сознательно не конвертируем: absolute вырвал бы
         // элемент из потока, и контент под ним прыгнул бы вверх. Sticky сам
         // держится своей позиции в потоке, а скролл у нас всё равно 0.
@@ -444,6 +448,28 @@
             bt: parseFloat(cs.borderTopWidth) || 0,
             bb: parseFloat(cs.borderBottomWidth) || 0
         });
+    }
+
+    // position:fixed внутри предка с transform/filter/contain/will-change уже
+    // НЕ привязан к вьюпорту: его содержащий блок — этот предок. Скрипт считает
+    // left/top от вьюпорта, поэтому такой элемент уезжал на сотни пикселей
+    // (замерено: -195 px по X на тестовой странице). Такие узлы не трогаем —
+    // они корректно масштабируются вместе со своим контейнером.
+    function hasTransformAncestor(el) {
+        let p = el.parentElement;
+        while (p && p !== document.documentElement && p !== document.body) {
+            let cs2;
+            try { cs2 = getComputedStyle(p); } catch (e) { return true; }
+            if (!cs2) return true;
+            if (cs2.transform && cs2.transform !== 'none') return true;
+            if (cs2.filter && cs2.filter !== 'none') return true;
+            if (cs2.backdropFilter && cs2.backdropFilter !== 'none') return true;
+            if (cs2.perspective && cs2.perspective !== 'none') return true;
+            if (cs2.contain && /paint|layout|strict|content/i.test(cs2.contain)) return true;
+            if (cs2.willChange && /transform|perspective|filter/i.test(cs2.willChange)) return true;
+            p = p.parentElement;
+        }
+        return false;
     }
 
     function collectFixed(scope, out) {
