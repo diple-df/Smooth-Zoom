@@ -21,7 +21,7 @@
     const HTML_NS = 'http://www.w3.org/1999/xhtml';
     // Свойства, которые скрипт трогает у <html> и у конвертированных fixed-элементов.
     const ROOT_PROPS = ['transform', 'transform-origin', 'will-change', 'transition'];
-    const FIXED_PROPS = ['position', 'top', 'left', 'right', 'bottom', 'width', 'height', 'margin', 'box-sizing'];
+    const FIXED_PROPS = ['position', 'top', 'left', 'right', 'bottom', 'width', 'height', 'margin', 'box-sizing', 'transform', 'transform-origin'];
 
     // ----- Настройки -----------------------------------------------------
     const DEFAULT_CFG = {
@@ -70,6 +70,11 @@
     let savedScrollBehavior = null;
     let savedFixed = [];           // [{ el, style: [[prop, value, priority], ...] }]
     let converted = new WeakSet(); // уже сконвертированные элементы (не перечитываем стили)
+    // Позиция fixed-элемента в координатах вьюпорта на масштабе 1. Нужна,
+    // чтобы пересчитывать его при каждой смене зума: без этого шапка и
+    // модальные окна уезжали за экран вместе с масштабом.
+    let captureNatural = true;     // true на входе: rect ещё не искажён transform'ом
+    let lastRepoS = -1, lastRepoTx = 0, lastRepoTy = 0;
     let willChangeOn = false;
     let animOn = false;            // на <html> сейчас стоит анимирующий transition
     let frameHandle = 0;
@@ -282,13 +287,18 @@
     function applyFixed(items) {
         const n = items.length;
         if (!n) return;
+        // Появились новые элементы — кэш «уже пересчитано» недействителен,
+        // иначе repoFixed() не поставит им контр-масштаб при том же зума.
+        lastRepoS = -1;
         const inv = convS > 0 ? 1 / convS : 1;
         for (let i = 0; i < n; i++) {
             const f = items[i];
             const el = f.el;
             if (!el) continue;
             try {
-                savedFixed.push({ el: el, style: grabStyle(el, FIXED_PROPS) });
+                const rec = { el: el, style: grabStyle(el, FIXED_PROPS) };
+                savedFixed.push(rec);
+                f.rec = rec;
                 converted.add(el);
                 setImp(el, 'position', 'absolute');
                 setImp(el, 'margin', '0');
@@ -334,6 +344,52 @@
                 } catch (e) {
                     // пропускаем
                 }
+            }
+            // Запоминаем поправку на offsetParent и позицию в координатах
+            // вьюпорта (она не зависит от зума — fixed всегда в экране).
+            const rec = f.rec;
+            if (rec) {
+                rec.dx = dx;
+                rec.dy = dy;
+                rec.nx = f.rect.left;
+                rec.ny = f.rect.top;
+                // Элемент появился уже под зумом (модалка, тост): его rect
+                // искажён transform'ом. Приводим к тому месту, где он был бы
+                // на масштабе 1: local + origin. Иначе он уедет за экран.
+                if (!captureNatural && convS > 0) {
+                    rec.nx = f.left + originX;
+                    rec.ny = f.top + originY;
+                }
+            }
+        }
+    }
+
+    // Пересчёт fixed-элементов при смене масштаба: каждый остаётся там же на
+    // экране, где был на 100%, вместо того чтобы уезжать вместе с контентом.
+    function repoFixed() {
+        const n = savedFixed.length;
+        if (!n) return;
+        if (lastRepoS === scale && lastRepoTx === tx && lastRepoTy === ty) return;
+        lastRepoS = scale;
+        lastRepoTx = tx;
+        lastRepoTy = ty;
+        const inv = scale > 0 ? 1 / scale : 1;
+        for (let i = 0; i < n; i++) {
+            const r = savedFixed[i];
+            if (!r || !r.el || !r.el.isConnected) continue;
+            if (r.nx === undefined) continue;
+            // local = (экранная цель - origin - translate) / scale
+            const lx = (r.nx - originX - tx) * inv + r.dx;
+            const ly = (r.ny - originY - ty) * inv + r.dy;
+            try {
+                setImp(r.el, 'left', lx + 'px');
+                setImp(r.el, 'top', ly + 'px');
+                // Контр-масштаб: fixed живёт в экране, поэтому зум страницы
+                // не должен его растягивать. origin — в собственный угол.
+                setImp(r.el, 'transform-origin', '0 0');
+                setImp(r.el, 'transform', 'scale(' + (scale > 0 ? 1 / scale : 1) + ')');
+            } catch (e) {
+                // пропускаем
             }
         }
     }
@@ -470,6 +526,7 @@
             clampPan();
         }
         writeTransform();
+        repoFixed();
         armCrisp();
         if (scale <= 1.0001) armExit();
     }
@@ -552,9 +609,12 @@
         geoDirty = false;
 
         try {
+            captureNatural = true;
             convertFixedElements();
         } catch (e) {
             // игнорируем ошибки конвертации fixed
+        } finally {
+            captureNatural = false;
         }
 
         try {
