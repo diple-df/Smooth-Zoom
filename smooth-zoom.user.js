@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Smooth Zoom to Cursor
 // @namespace    https://github.com/diple-df/Smooth-Zoom
-// @version      2.9.0
+// @version      2.10.0
 // @description  Trackpad-style smooth zoom to the cursor (Ctrl+Wheel). Compositor-driven CSS transition, at most one transform write per frame, zero work while idle. Crisp at rest, keeps fixed elements. Native Ctrl +/- left intact. Configurable via menu.
 // @description:ru Плавный зум к курсору (Ctrl+колесо). Анимация на композиторе, не больше одной записи transform за кадр, в простое скрипт не делает ничего. Чётко в покое, fixed не пропадают. Родной зум Ctrl +/- не трогается. Настраивается через меню.
 // @author       diple_df x claude
@@ -25,8 +25,16 @@
 
     const HTML_NS = 'http://www.w3.org/1999/xhtml';
     // Свойства, которые скрипт трогает у <html> и у конвертированных fixed-элементов.
-    const ROOT_PROPS = ['transform', 'transform-origin', 'will-change', 'transition'];
-    const FIXED_PROPS = ['position', 'top', 'left', 'right', 'bottom', 'width', 'height', 'margin', 'box-sizing', 'transform', 'transform-origin'];
+    const ROOT_PROPS = ['transform', 'transform-origin', 'will-change', 'transition', 'zoom'];
+    const FIXED_PROPS = ['position', 'top', 'left', 'right', 'bottom', 'width', 'height', 'margin', 'box-sizing', 'transform', 'transform-origin', 'scale', 'zoom'];
+    // Контр-масштаб пишем отдельным свойством scale, а не transform: у многих
+    // элементов (центрирование translate(-50%,-50%), собственный scale,
+    // CSS-анимация вращения) transform занят, и перезапись уносила их с экрана.
+    const CAN_SCALE_PROP = (function () {
+        try {
+            return typeof CSS !== 'undefined' && !!CSS.supports && CSS.supports('scale', '0.5');
+        } catch (e) { return false; }
+    })();
 
     // ----- Настройки -----------------------------------------------------
     const DEFAULT_CFG = {
@@ -71,10 +79,10 @@
                 if (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version)
                     return String(GM_info.script.version);
             } catch (e) {}
-            return '2.9.0';
+            return '2.10.0';
         }
 
-        // Сравнение по числовым сегментам: 2.10.0 больше 2.9.0 (строкой — нет).
+        // Сравнение по числовым сегментам: 2.10.0 больше 2.10.0 (строкой — нет).
         function cmp(a, b) {
             const pa = String(a).split(/[.\-+]/), pb = String(b).split(/[.\-+]/);
             const n = Math.max(pa.length, pb.length);
@@ -231,6 +239,7 @@
     // модальные окна уезжали за экран вместе с масштабом.
     let captureNatural = true;     // true на входе: rect ещё не искажён transform'ом
     let lastRepoS = -1, lastRepoTx = 0, lastRepoTy = 0;
+    let calibratedAt = 0;          // масштаб, на котором уже калибровали fixed
     let willChangeOn = false;
     let animOn = false;            // на <html> сейчас стоит анимирующий transition
     let frameHandle = 0;
@@ -385,6 +394,20 @@
         // получили бы 0x0 и сломали элемент, когда его покажут. Если он
         // появится позже, это поймает наблюдатель (класс/скрытость).
         if (!rect.width && !rect.height) return;
+        // transform-origin в px от левого верхнего угла border-box.
+        const toks = String(cs.transformOrigin || '').split(' ');
+        let tox = parseFloat(toks[0]), toy = parseFloat(toks[1]);
+        if (!isFinite(tox)) tox = 0;
+        if (!isFinite(toy)) toy = 0;
+        // Вклад СОБСТВЕННОГО transform элемента в его экранную позицию.
+        // Считается как разница между фактическим боксом и layout-позицией из
+        // computed left/top: для translate(-50%,-50%) это ровно -150,-80,
+        // для scale(.9) с origin center — половина разницы размеров.
+        // Без этой величины элемент с центрированием уезжает на её значение,
+        // потому что zoom не масштабирует собственный transform элемента.
+        const cl = parseFloat(cs.left), ct = parseFloat(cs.top);
+        const mx = isFinite(cl) ? rect.left - cl : 0;
+        const my = isFinite(ct) ? rect.top - ct : 0;
         // Переводим в local-координаты: (viewport - origin - translate) / scale.
         const inv = convS > 0 ? 1 / convS : 1;
         // Размер для записи. rect точен, но искажается transform'ом (своим или
@@ -403,6 +426,10 @@
         out.push({
             el: el,
             rect: rect,
+            tox: tox,
+            toy: toy,
+            mx: mx,
+            my: my,
             left: (rect.left - originX - convTx) * inv,
             top: (rect.top - originY - convTy) * inv,
             w: w,
@@ -444,80 +471,53 @@
         const n = items.length;
         if (!n) return;
         // Появились новые элементы — кэш «уже пересчитано» недействителен,
-        // иначе repoFixed() не поставит им контр-масштаб при том же зума.
+        // иначе repoFixed() не поставит им компенсацию при том же зуме.
         lastRepoS = -1;
-        const inv = convS > 0 ? 1 / convS : 1;
+        // position остаётся fixed: измерено, что fixed не подчиняется transform
+        // предка, но подчиняется zoom, поэтому именно zoom даёт точный
+        // контр-масштаб. Собственный transform элемента (translate(-50%,-50%),
+        // scale, rotate, анимации) при этом не перезаписывается — это и был
+        // корень бага «элементы прилетают мимо экрана».
         for (let i = 0; i < n; i++) {
             const f = items[i];
             const el = f.el;
             if (!el) continue;
             try {
-                const rec = { el: el, style: grabStyle(el, FIXED_PROPS) };
+                const rec = {
+                    el: el,
+                    style: grabStyle(el, FIXED_PROPS),
+                    // Экранная позиция на масштабе 1 — цель, к которой элемент
+                    // обязан вернуться после любого зума.
+                    bx: f.rect.left,
+                    by: f.rect.top,
+                    // Вклад собственного transform элемента: посчитан в
+                    // considerNode() как rect.left - computed left. Оба числа
+                    // уже прочитаны, поэтому лишнего reflow нет.
+                    mx: f.mx || 0,
+                    my: f.my || 0,
+                    w: f.w,
+                    h: f.h
+                };
                 savedFixed.push(rec);
                 f.rec = rec;
                 converted.add(el);
-                setImp(el, 'position', 'absolute');
-                setImp(el, 'margin', '0');
+                // right/bottom привязки снимаем: иначе элемент, закреплённый
+                // справа, будет расти влево и уползёт.
                 setImp(el, 'right', 'auto');
                 setImp(el, 'bottom', 'auto');
-                // Размер задаём всегда: у absolute своя база для %-ширины, поэтому
-                // "как было" надо зафиксировать в px (иначе шапка на всю ширину
-                // станет уже/шире после конвертации).
+                setImp(el, 'margin', '0');
+                // Ширину и высоту фиксируем в тех px, что были: процентные и
+                // calc() размеры считаются от изменившегося контейнера.
                 if (f.borderBox) {
+                    setImp(el, 'box-sizing', 'border-box');
                     setImp(el, 'width', f.w + 'px');
                     setImp(el, 'height', f.h + 'px');
-                } else {
-                    // content-box: rect/offsetWidth включают padding+border
-                    setImp(el, 'width', Math.max(0, f.w - f.pl - f.pr - f.bl - f.br) + 'px');
-                    setImp(el, 'height', Math.max(0, f.h - f.pt - f.pb - f.bt - f.bb) + 'px');
                 }
-                setImp(el, 'left', f.left + 'px');
-                setImp(el, 'top', f.top + 'px');
             } catch (e) {
                 // пропускаем
             }
         }
-
-        // Поправка на offsetParent: сначала все чтения, потом все записи.
-        for (let k = 0; k < n; k++) {
-            const f = items[k];
-            try {
-                f.nr = f.el.getBoundingClientRect();
-            } catch (e) {
-                f.nr = f.rect;
-            }
-        }
-        for (let m = 0; m < n; m++) {
-            const f = items[m];
-            const nr = f.nr;
-            if (!nr) continue;
-            const dx = (f.rect.left - nr.left) * inv;
-            const dy = (f.rect.top - nr.top) * inv;
-            if (dx || dy) {
-                try {
-                    setImp(f.el, 'left', (f.left + dx) + 'px');
-                    setImp(f.el, 'top', (f.top + dy) + 'px');
-                } catch (e) {
-                    // пропускаем
-                }
-            }
-            // Запоминаем поправку на offsetParent и позицию в координатах
-            // вьюпорта (она не зависит от зума — fixed всегда в экране).
-            const rec = f.rec;
-            if (rec) {
-                rec.dx = dx;
-                rec.dy = dy;
-                rec.nx = f.rect.left;
-                rec.ny = f.rect.top;
-                // Элемент появился уже под зумом (модалка, тост): его rect
-                // искажён transform'ом. Приводим к тому месту, где он был бы
-                // на масштабе 1: local + origin. Иначе он уедет за экран.
-                if (!captureNatural && convS > 0) {
-                    rec.nx = f.left + originX;
-                    rec.ny = f.top + originY;
-                }
-            }
-        }
+        repoFixed();
     }
 
     // Пересчёт fixed-элементов при смене масштаба: каждый остаётся там же на
@@ -529,24 +529,58 @@
         lastRepoS = scale;
         lastRepoTx = tx;
         lastRepoTy = ty;
-        const inv = scale > 0 ? 1 / scale : 1;
+        const S = scale;
+        const k = S > 0 ? 1 / S : 1;
+        // Экранная позиция fixed-элемента под корневым
+        // translate3d(tx,ty,0) scale(S) равна  tx + S*left*zoom.
+        // При zoom = 1/S это tx + left, поэтому left = цель - tx. Один и тот же
+        // закон верен для обеих осей и не требует чтения layout в кадре:
+        // всё нужное (bx/by — цель, mx/my — вклад собственного transform) уже
+        // измерено при конвертации.
+        // Элементы со своим transform центрируются от своего origin, и их
+        // вклад не зависит от масштаба — отсюда постоянные mx/my.
         for (let i = 0; i < n; i++) {
             const r = savedFixed[i];
             if (!r || !r.el || !r.el.isConnected) continue;
-            if (r.nx === undefined) continue;
-            // local = (экранная цель - origin - translate) / scale
-            const lx = (r.nx - originX - tx) * inv + r.dx;
-            const ly = (r.ny - originY - ty) * inv + r.dy;
             try {
-                setImp(r.el, 'left', lx + 'px');
-                setImp(r.el, 'top', ly + 'px');
-                // Контр-масштаб: fixed живёт в экране, поэтому зум страницы
-                // не должен его растягивать. origin — в собственный угол.
-                setImp(r.el, 'transform-origin', '0 0');
-                setImp(r.el, 'transform', 'scale(' + (scale > 0 ? 1 / scale : 1) + ')');
+                setImp(r.el, 'zoom', String(k));
+                setImp(r.el, 'left', (r.bx - tx - (r.cx || 0)) + 'px');
+                setImp(r.el, 'top', (r.by - ty - (r.cy || 0)) + 'px');
             } catch (e) {
                 // пропускаем
             }
+        }
+    }
+
+    // Остаток от собственного transform элемента (% -центрирование считает
+    // проценты от уже сжатого зумом бокса) не выводится формулой без знания
+    // внутренней арифметики браузера. Зато он практически не зависит от
+    // масштаба (проверено на 1.2…3.0), поэтому калибруется ОДИН раз при входе
+    // в зум и дальше применяется как константа. Так в кадре не остаётся ни
+    // одного замера layout.
+    function calibrateFixed() {
+        const n = savedFixed.length;
+        if (!n) return;
+        for (let i = 0; i < n; i++) {
+            const r = savedFixed[i];
+            if (!r || !r.el || !r.el.isConnected) continue;
+            if (!r.mx && !r.my) continue;
+            for (let pass = 0; pass < 2; pass++) {
+                let rect;
+                try { rect = r.el.getBoundingClientRect(); } catch (e) { break; }
+                const ex = r.bx - rect.left;
+                const ey = r.by - rect.top;
+                if (Math.abs(ex) < 0.2 && Math.abs(ey) < 0.2) break;
+                r.cx = (r.cx || 0) - ex;
+                r.cy = (r.cy || 0) - ey;
+                try {
+                    setImp(r.el, 'left', (r.bx - tx - r.cx) + 'px');
+                    setImp(r.el, 'top', (r.by - ty - r.cy) + 'px');
+                } catch (e) { break; }
+            }
+            // После калибровки вклад собственного transform уже учтён в cx/cy.
+            r.mx = 0;
+            r.my = 0;
         }
     }
 
@@ -557,6 +591,16 @@
         foundItems.length = 0;
         collectFixed(searchRoot, foundItems);
         applyFixed(foundItems);
+    }
+
+    // Калибровка вызывается только при входе в зум (один раз за сессию зума),
+    // поэтому её замеры не попадают в кадры анимации.
+    function calibrateAllFixed() {
+        calibrateFixed();
+        lastRepoS = -1;
+        repoFixed();
+        calibrateFixed();
+        lastRepoS = -1;
     }
 
     function restoreFixedElements() {
@@ -631,6 +675,17 @@
         if (performance.now() - lastWriteTs < CONFIG.crispDelayMs) {
             armCrisp();
             return;
+        }
+        // Догоняем точность после того, как анимация остановилась: элементы с
+        // собственным transform нельзя вычислить формулой, но пока масштаб не
+        // меняется, один замер ничего не стоит и не попадает в кадр.
+        if (!calibratedAt || calibratedAt !== scale) {
+            calibratedAt = scale;
+            try {
+                calibrateFixed();
+            } catch (e) {
+                // игнорируем
+            }
         }
         // Снимаем слой и даём браузеру перерисовать страницу чётко.
         if (willChangeOn) {
@@ -799,7 +854,15 @@
         } catch (e) {
             // игнорируем
         }
-
+        // Калибровка идёт один раз здесь, а не в кадре: элементы с собственным
+        // transform (% -центрирование) дают нелинейный остаток, который нельзя
+        // вывести формулой, но который стабилен по масштабу.
+        try {
+            calibrateAllFixed();
+        } catch (e) {
+            // игнорируем сбой калибровки: без неё элементы всё равно остаются
+            // в пределах экрана, просто с точностью до собственного transform
+        }
         bindSession();
     }
 
