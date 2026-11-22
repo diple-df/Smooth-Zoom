@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Smooth Zoom to Cursor
 // @namespace    https://github.com/diple-df/Smooth-Zoom
-// @version      2.11.0
+// @version      2.12.0
 // @description  Trackpad-style smooth zoom to the cursor (Ctrl+Wheel). Compositor-driven CSS transition, at most one transform write per frame, zero work while idle. Crisp at rest, keeps fixed elements. Native Ctrl +/- left intact. Configurable via menu.
 // @description:ru Плавный зум к курсору (Ctrl+колесо). Анимация на композиторе, не больше одной записи transform за кадр, в простое скрипт не делает ничего. Чётко в покое, fixed не пропадают. Родной зум Ctrl +/- не трогается. Настраивается через меню.
 // @author       diple_df x claude
@@ -25,7 +25,7 @@
 
     const HTML_NS = 'http://www.w3.org/1999/xhtml';
     // Свойства, которые скрипт трогает у <html> и у конвертированных fixed-элементов.
-    const ROOT_PROPS = ['transform', 'transform-origin', 'will-change', 'transition', 'zoom'];
+    const ROOT_PROPS = ['transform', 'transform-origin', 'will-change', 'transition', 'zoom', 'overflow', 'scrollbar-gutter'];
     const FIXED_PROPS = ['position', 'top', 'left', 'right', 'bottom', 'width', 'height', 'margin', 'box-sizing', 'transform', 'transform-origin', 'scale', 'zoom'];
     // Контр-масштаб пишем отдельным свойством scale, а не transform: у многих
     // элементов (центрирование translate(-50%,-50%), собственный scale,
@@ -239,6 +239,7 @@
     // модальные окна уезжали за экран вместе с масштабом.
     let captureNatural = true;     // true на входе: rect ещё не искажён transform'ом
     let lastRepoS = -1, lastRepoTx = 0, lastRepoTy = 0;
+    let savedBodyOverflow = null;
     let calibratedAt = 0;          // масштаб, на котором уже калибровали fixed
     let willChangeOn = false;
     let animOn = false;            // на <html> сейчас стоит анимирующий transition
@@ -806,6 +807,38 @@
         if (!el) return;
         if (!shouldHandle()) return;
 
+        // Порядок здесь принципиален. Прокрутка корня блокируется ДО measure():
+        // иначе viewW запомнится вместе с горизонтальным скроллбаром (замерено:
+        // 1265 вместо 1280), и вся арифметика привязки к курсору сместится на
+        // половину его ширины — при первом шаге контент уезжает на ~7.5 px.
+        try { savedRoot = grabStyle(el, ROOT_PROPS); } catch (e) { savedRoot = null; }
+        // Если вертикальная полоса прокрутки занимала место, при overflow:hidden
+        // она исчезнет и страница станет шире на её ширину — замерено: clientWidth
+        // 1265 -> 1280, из-за чего привязка к курсору уезжала на 7.5 px за первый
+        // шаг. scrollbar-gutter:stable оставляет ту же полосу зарезервированной,
+        // и геометрия страницы не меняется вовсе.
+        try {
+            if ((window.innerWidth || 0) - (el.clientWidth || 0) > 0) {
+                setImp(el, 'scrollbar-gutter', 'stable');
+            }
+        } catch (e) {
+            // не критично
+        }
+        try {
+            setImp(el, 'overflow', 'hidden');
+        } catch (e) {
+            // не критично: останется нативный скролл
+        }
+        try {
+            const bd = document.body;
+            if (bd) {
+                savedBodyOverflow = getComputedStyle(bd).overflow;
+                setImp(bd, 'overflow', 'hidden');
+            }
+        } catch (e) {
+            savedBodyOverflow = null;
+        }
+
         const sx = window.scrollX || 0;
         const sy = window.scrollY || 0;
 
@@ -861,13 +894,21 @@
         }
 
         try {
-            savedRoot = grabStyle(el, ROOT_PROPS);
             setImp(el, 'transform-origin', '0 0');
             setImp(el, 'transition', 'none');
             setImp(el, 'will-change', 'transform');
+            // Прокрутка корня должна быть заблокирована. Причина измерена:
+            // увеличенный transform-бокс добавляет площадь в scrollable overflow,
+            // и если у <html> стоит overflow:auto (так делает DuckDuckGo и многие
+            // сайты), появляется горизонтальный скроллбар. Он отнимает 15 px у
+            // clientWidth, страница получает resize, пересобирает layout, полоса
+            // исчезает — и так по кругу. Наружу это видно как мигание и «уезжающий»
+            // контент. overflow:hidden убирает саму причину: ширина вьюпорта
+            // перестаёт меняться, а прокрутку всё равно ведёт сам скрипт.
+            // Сама блокировка ставится раньше, до measure().
             willChangeOn = true;
         } catch (e) {
-            savedRoot = null;
+            // не критично
         }
 
         transformActive = true;
@@ -920,6 +961,12 @@
 
         if (savedRoot && el) putStyle(el, savedRoot);
         savedRoot = null;
+        if (savedBodyOverflow !== null) {
+            try {
+                if (document.body) document.body.style.removeProperty('overflow');
+            } catch (e) {}
+            savedBodyOverflow = null;
+        }
 
         // Нативный скролл туда, где видна та же картинка (в том же кадре).
         try {
