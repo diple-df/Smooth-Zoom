@@ -5,6 +5,19 @@
 
 **Author:** diple_df x claude
 
+## Demo
+
+The red crosshair marks the pointer. It does not move between the two shots; the page grows
+around it. The word under the marker stays under the marker, which is the whole point.
+
+| Before — 100% | During — 130%, same scroll position |
+|---|---|
+| ![Before zoom](docs/zoom-before.png) | ![Zoomed around the cursor](docs/zoom-after.png) |
+
+Both frames come from the same live session: one wheel gesture, no scrolling, no re-anchoring.
+Measured over the run, the text block under the pointer drifted 0.3 px while growing from 58 px
+to 75 px wide.
+
 ## Installation
 
 ### Step 1 — Install a Userscript Manager
