@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Smooth Zoom to Cursor
 // @namespace    https://github.com/diple-df/Smooth-Zoom
-// @version      2.15.0
+// @version      2.16.1
 // @description  Trackpad-style smooth zoom to the cursor (Ctrl+Wheel). Compositor-driven CSS transition, at most one transform write per frame, zero work while idle. Crisp at rest, keeps fixed elements. Native Ctrl +/- left intact. Configurable via menu.
 // @description:ru Плавный зум к курсору (Ctrl+колесо). Анимация на композиторе, не больше одной записи transform за кадр, в простое скрипт не делает ничего. Чётко в покое, fixed не пропадают. Родной зум Ctrl +/- не трогается. Настраивается через меню.
 // @author       diple_df x claude
@@ -26,7 +26,7 @@
     const HTML_NS = 'http://www.w3.org/1999/xhtml';
     // Свойства, которые скрипт трогает у <html> и у конвертированных fixed-элементов.
     const ROOT_PROPS = ['transform', 'transform-origin', 'will-change', 'transition', 'zoom', 'overflow', 'scrollbar-gutter'];
-    const FIXED_PROPS = ['position', 'top', 'left', 'right', 'bottom', 'width', 'height', 'margin', 'box-sizing', 'transform', 'transform-origin', 'scale', 'zoom'];
+    const FIXED_PROPS = ['position', 'top', 'left', 'right', 'bottom', 'width', 'height', 'margin', 'box-sizing', 'transform', 'transform-origin', 'scale', 'translate', 'zoom', 'will-change'];
     // Контр-масштаб пишем отдельным свойством scale, а не transform: у многих
     // элементов (центрирование translate(-50%,-50%), собственный scale,
     // CSS-анимация вращения) transform занят, и перезапись уносила их с экрана.
@@ -240,6 +240,9 @@
     let captureNatural = true;     // true на входе: rect ещё не искажён transform'ом
     let lastRepoS = -1, lastRepoTx = 0, lastRepoTy = 0;
     let savedBodyOverflow = null;
+    // Прокрутка на входе в зум. Цель fixed-элемента задаётся в экранных
+    // координатах, а local-координаты отсчитаны от документа при scroll 0.
+    let entrySx = 0, entrySy = 0;
     let calibratedAt = 0;          // масштаб, на котором уже калибровали fixed
     let willChangeOn = false;
     let animOn = false;            // на <html> сейчас стоит анимирующий transition
@@ -368,12 +371,17 @@
     // записи. Иначе каждая запись вызывала бы новый style/layout пересчёт.
     function considerNode(el, out) {
         if (converted.has(el)) return;
-        // Сами себя не конвертируем и вложенные fixed не трогаем: у них уже
-        // другой offsetParent, и absolute сломал бы их привязку.
-        let p = el.parentElement;
+        // Вложенный fixed внутри уже сконвертированного fixed раньше
+        // пропускался целиком: считалось, что он «уже в своём контексте».
+        // Замерено на фикстуре ytlike.html: диалог в shadow root внутри
+        // #popup-container уезжал с 428.5,341 до 99.7,106.9 и сжимался
+        // 408x118 -> 248x72 (на YouTube так выглядят tp-yt-paper-dialog, меню
+        // аккаунта, тултипы плеера). Обрабатываем его отдельным режимом ниже.
+        let nestedIn = null;
+        let p = parentAcross(el);
         while (p) {
-            if (converted.has(p)) return;
-            p = p.parentElement;
+            if (converted.has(p)) { nestedIn = p; break; }
+            p = parentAcross(p);
         }
         let cs;
         try {
@@ -383,16 +391,19 @@
         }
         if (!cs) return;
         const isAbs = cs.position === 'absolute';
+        // Sticky НЕ компенсируем: он остаётся в потоке и обязан
+        // масштабироваться вместе с контентом. Компенсация сдвигом
+        // возвращала top на место, но ширина росла 1193 -> 1960 при
+        // scale 1.643 (замерено на ytlike.html) — полоса «дёргалась».
         if (cs.position !== 'fixed' && !isAbs) return;
         // Содержащий блок не вьюпорт — элемент уже живёт в своём контексте
         // и масштабируется вместе с ним. Замерено: попытка компенсировать
         // такой узел давала промах до 784 px по вертикали.
-        if (hasTransformAncestor(el)) return;
+        // Вложенный в НАШ сконвертированный fixed — исключение: остановка
+        // обхода на нём, иначе наш собственный zoom предка считался бы чужим.
+        if (hasTransformAncestor(el, nestedIn || null)) return;
         // Для absolute решение принимается ниже, когда уже есть rect.
         let overlayAbs = false;
-        // position: sticky сознательно не конвертируем: absolute вырвал бы
-        // элемент из потока, и контент под ним прыгнул бы вверх. Sticky сам
-        // держится своей позиции в потоке, а скролл у нас всё равно 0.
         let rect;
         try {
             rect = el.getBoundingClientRect();
@@ -445,9 +456,20 @@
             my: my,
             left: (rect.left - originX - convTx) * inv,
             top: (rect.top - originY - convTy) * inv,
+            // Цель в экранных координатах для right/bottom-привязки: rect под
+            // корневым transform даёт неверный top (замерено 1449 вместо 540).
+            natLeft: naturalTargetX(el, cs, w, viewW || innerWidth),
+            natTop: naturalTargetY(el, cs, h, viewH || innerHeight),
             w: w,
             h: h,
             kind: overlayAbs ? 'abs' : 'fixed',
+            // Вложенный в НАШ fixed: содержащий блок — уже сконвертированный
+            // предок, поэтому left/top считаются от его экрана, а не от
+            // вьюпорта. Второй zoom ему не нужен (родительский уже применён),
+            // достаточно zoom:1 и left = цель - tx — замерено в sznest4.mjs:
+            // 700,500 при цели 700,500 (0 px), тогда как формула «как для
+            // верхнего уровня» давала 143.3,94.1 вместо 700,500.
+            nested: !!nestedIn,
             // Растянут сверху и снизу одновременно (inset:0, top:0;bottom:0).
             // У таких высоту задаёт пара top/bottom, а мы её снимаем — без
             // явного height элемент схлопнулся бы: замерено, маска ушла с
@@ -501,6 +523,14 @@
         const eps = 2;
         if (rect.left <= eps || rect.top <= eps ||
             rect.right >= vw - eps || rect.bottom >= vh - eps) return true;
+        // Оверлей с end-привязкой (right и/или bottom) — даже если он не
+        // прижат к краю вплотную: панель DDG стоит на right:17px, top:67px,
+        // то есть в 17 px от края, и под eps=2 не попадала. Такой узел под
+        // корневым transform раздувается 302x355 -> 496x583 и уезжает на
+        // 1142.7,-147.1 (замерено, szmv.mjs). Привязка к right/bottom видна
+        // по геометрии: left+width+right ~= vw выполняется только когда
+        // элемент реально отсчитан от правого края.
+        if (anchoredToRight(el, cs, rect, vw, vh) || anchoredToBottom(el, cs, rect, vw, vh)) return true;
         // Отцентрована по вьюпорту: диалоги и тосты с left/top:50%.
         const cx = rect.left + rect.width / 2;
         const cy = rect.top + rect.height / 2;
@@ -509,14 +539,97 @@
         return false;
     }
 
+    // Предок с переходом через границу shadow root: узел внутри shadow-дерева
+    // не имеет parentElement выше хоста, поэтому цепочка обрывалась и
+    // вложенность в сконвертированный оверлей не определялась.
+    function parentAcross(el) {
+        if (el.parentElement) return el.parentElement;
+        try {
+            const r = el.getRootNode && el.getRootNode();
+            if (r && r.host) return r.host;
+        } catch (e) {}
+        return null;
+    }
+
+    // Цель fixed-элемента в экранных координатах на масштабе 1.
+    // Прямое взятие rect.left/rect.top неверно в двух случаях, замеренных на
+    // масштабе 1.3924 (szpct.mjs, szanchor2.mjs):
+    //   right:100px;bottom:200px;150x60 честно стоит на 1015,540, а rect под
+    //   transform даёт top 1449 (промах 909 px) — bottom/right якорь;
+    //   left:50%;top:50% даёт computed top 854.5 вместо 400 (промах 454.5) —
+    //   проценты считаются от растянутого документа.
+    // Поэтому цель выводится заново: процентные и end-якоря пересчитываются от
+    // вьюпорта, пиксельные left/top берутся из computed как есть.
+    function endAnchored(el, axis) {
+        let t, e;
+        try {
+            if (axis === 'y') { t = el.style.top; e = el.style.bottom; }
+            else { t = el.style.left; e = el.style.right; }
+        } catch (err) { return false; }
+        if (t && t !== 'auto') return false;
+        return !!e && e !== 'auto';
+    }
+
+    // Признак «элемент отсчитан от правого/нижнего края вьюпорта».
+    // По computed left/right это не отличить: у CSS-класса right:17px браузер
+    // материализует и left (961px). Зато геометрия выдаёт привязку:
+    // left + width + right сходится с шириной вьюпорта.
+    // ВАЖНО: под это же условие попадает центрированный элемент
+    // (left:50%; translate(-50%,-50%)): 429+422+429 = 1280 ровно, и он
+    // получал bx=640 вместо 429 (замерено, szmodal.mjs). Поэтому
+    // самотрансформированные элементы исключаем: их вклад уже учтён в mx/my.
+    function anchoredToRight(el, cs, rect, vw) {
+        if (cs.transform && cs.transform !== 'none') return false;
+        const r = parseFloat(cs.right), l = parseFloat(cs.left);
+        if (!isFinite(r)) return false;
+        if (isFinite(l) && Math.abs(l + rect.width + r - vw) < 1.5) return true;
+        return !!(el.style.right && el.style.right !== 'auto');
+    }
+
+    function anchoredToBottom(el, cs, rect, vh) {
+        if (cs.transform && cs.transform !== 'none') return false;
+        const b = parseFloat(cs.bottom), t = parseFloat(cs.top);
+        if (!isFinite(b)) return false;
+        if (isFinite(t) && Math.abs(t + rect.height + b - vh) < 1.5) return true;
+        return !!(el.style.bottom && el.style.bottom !== 'auto');
+    }
+
+    function inlinePct(el, axis) {
+        let v;
+        try { v = axis === 'y' ? el.style.top : el.style.left; } catch (e) { return null; }
+        if (!v || v.indexOf('%') < 0) return null;
+        const n = parseFloat(v);
+        return isFinite(n) ? n : null;
+    }
+
+    function naturalTargetX(el, cs, w, vw) {
+        const pct = inlinePct(el, 'x');
+        if (pct != null) return (vw * pct) / 100;
+        if (!endAnchored(el, 'x')) return null;
+        const r = parseFloat(cs.right);
+        if (!isFinite(r)) return null;
+        return vw - r - w - (parseFloat(cs.marginLeft) || 0) - (parseFloat(cs.marginRight) || 0);
+    }
+
+    function naturalTargetY(el, cs, h, vh) {
+        const pct = inlinePct(el, 'y');
+        if (pct != null) return (vh * pct) / 100;
+        if (!endAnchored(el, 'y')) return null;
+        const b = parseFloat(cs.bottom);
+        if (!isFinite(b)) return null;
+        return vh - b - h - (parseFloat(cs.marginTop) || 0) - (parseFloat(cs.marginBottom) || 0);
+    }
+
     // position:fixed внутри предка с transform/filter/contain/will-change уже
     // НЕ привязан к вьюпорту: его содержащий блок — этот предок. Скрипт считает
     // left/top от вьюпорта, поэтому такой элемент уезжал на сотни пикселей
     // (замерено: -195 px по X на тестовой странице). Такие узлы не трогаем —
     // они корректно масштабируются вместе со своим контейнером.
-    function hasTransformAncestor(el) {
-        let p = el.parentElement;
-        while (p && p !== document.documentElement && p !== document.body) {
+    // stopAt — предок, на котором обход прекращается (для вложенных в наш
+    // собственный fixed: он сам создаёт нужный нам кадр).
+    function hasTransformAncestor(el, stopAt) {
+        let p = parentAcross(el);
+        while (p && p !== document.documentElement && p !== document.body && p !== stopAt) {
             let cs2;
             try { cs2 = getComputedStyle(p); } catch (e) { return true; }
             if (!cs2) return true;
@@ -526,15 +639,14 @@
             if (cs2.perspective && cs2.perspective !== 'none') return true;
             if (cs2.contain && /paint|layout|strict|content/i.test(cs2.contain)) return true;
             if (cs2.willChange && /transform|perspective|filter/i.test(cs2.willChange)) return true;
-            p = p.parentElement;
+            p = parentAcross(p);
         }
         return false;
     }
 
     // Обход одного дерева. shadowDepth ограничивает вложенность, чтобы
     // патологическая страница не зациклила нас на собственных пересозданиях.
-    function collectTree(root, out, shadowDepth) {
-        if (!root || !root.isConnected) return;
+    function collectTree(root, out, shadowDepth) {        if (!root || !root.isConnected) return;
         if (root.nodeType === 1 && (!root.namespaceURI || root.namespaceURI === HTML_NS)) {
             considerNode(root, out);
             if (shadowDepth < 6) collectShadow(root, out, shadowDepth);
@@ -588,6 +700,16 @@
             const el = f.el;
             if (!el) continue;
             try {
+                // Вложенность перепроверяем в момент записи: предок и потомок
+                // могут прийти одним батчем (YouTube вставляет поддерево
+                // целиком), и тогда при сборе предок ещё не был в converted.
+                // Обход идёт в прямом порядке, поэтому родитель уже добавлен.
+                let nestedIn = null;
+                let pp = parentAcross(el);
+                while (pp) {
+                    if (converted.has(pp)) { nestedIn = pp; break; }
+                    pp = parentAcross(pp);
+                }
                 const rec = {
                     el: el,
                     style: grabStyle(el, FIXED_PROPS),
@@ -601,8 +723,16 @@
                     // отдаёт rect, уже сдвинутый корневым transform: при
                     // масштабе 1.39 модалка уезжала на -251,-157 px, то есть
                     // целиком за экран. Это и есть «лишние элементы при зуме».
-                    bx: f.left + originX,
-                    by: f.top + originY,
+                    //
+                    // Вход в зум со скроллом: local-координаты отсчитаны от
+                    // документа при scroll 0, а цель нужна в экранных. Разница
+                    // ровно на величину прокрутки на входе. Без этой поправки
+                    // ВСЕ fixed разом съезжали вниз на scrollY: замерено на
+                    // ytlike.html при scrollY=400 — шапка 0 -> 400, мини-плеер
+                    // 596 -> 996, тост 376 -> 776. На YouTube это нормальный
+                    // сценарий: прокрутил ленту и крутанул Ctrl+колесо.
+                    bx: (f.natLeft != null ? f.natLeft : (f.left + originX - (captureNatural ? entrySx : 0))),
+                    by: (f.natTop != null ? f.natTop : (f.top + originY - (captureNatural ? entrySy : 0))),
                     // Вклад собственного transform элемента: посчитан в
                     // considerNode() как rect.left - computed left. Оба числа
                     // уже прочитаны, поэтому лишнего reflow нет.
@@ -610,7 +740,13 @@
                     my: f.my || 0,
                     w: f.w,
                     h: f.h,
-                    stretchedV: !!f.stretchedV
+                    stretchedV: !!f.stretchedV,
+                    // Вложенный в наш fixed: его кадром отсчёта служит экран
+                    // предка, поэтому собственный zoom ему не нужен.
+                    // Пересчитывается здесь, а не берётся из f.nested: в одном
+                    // батче предок попадает в converted только теперь.
+                    nested: !!nestedIn,
+                    nestedIn: nestedIn
                 };
                 savedFixed.push(rec);
                 f.rec = rec;
@@ -620,23 +756,25 @@
                 // элемент из его контекста наложения). Компенсация — те же
                 // left/top/zoom, что и у fixed.
                 rec.kind = f.kind || 'fixed';
-                // right/bottom привязки снимаем: иначе элемент, закреплённый
-                // справа, будет расти влево и уползёт.
-                setImp(el, 'right', 'auto');
-                setImp(el, 'bottom', 'auto');
-                setImp(el, 'margin', '0');
-                // Ширину и высоту фиксируем в тех px, что были: процентные и
-                // calc() размеры считаются от изменившегося контейнера.
-                // Ширину фиксируем ВСЕГДА: right снят, значит ширину больше
-                // ничто не задаёт, и auto схлопнул бы элемент по содержимому
-                // (замерено: шапка 1265 -> 224 px). box-sizing переводим в
-                // border-box, чтобы f.w (внешний размер) записался как есть.
-                setImp(el, 'box-sizing', 'border-box');
-                setImp(el, 'width', f.w + 'px');
-                // Высоту — когда она задана явно или когда её задавала пара
-                // top/bottom, которую мы только что сняли. У остальных
-                // auto-высоты содержимое может вырасти, и обрезать его нельзя.
-                if (f.borderBox || f.stretchedV) setImp(el, 'height', f.h + 'px');
+                {
+                    // right/bottom привязки снимаем: иначе элемент, закреплённый
+                    // справа, будет расти влево и уползёт.
+                    setImp(el, 'right', 'auto');
+                    setImp(el, 'bottom', 'auto');
+                    setImp(el, 'margin', '0');
+                    // Ширину и высоту фиксируем в тех px, что были: процентные и
+                    // calc() размеры считаются от изменившегося контейнера.
+                    // Ширину фиксируем ВСЕГДА: right снят, значит ширину больше
+                    // ничто не задаёт, и auto схлопнул бы элемент по содержимому
+                    // (замерено: шапка 1265 -> 224 px). box-sizing переводим в
+                    // border-box, чтобы f.w (внешний размер) записался как есть.
+                    setImp(el, 'box-sizing', 'border-box');
+                    setImp(el, 'width', f.w + 'px');
+                    // Высоту — когда она задана явно или когда её задавала пара
+                    // top/bottom, которую мы только что сняли. У остальных
+                    // auto-высоты содержимое может вырасти, и обрезать его нельзя.
+                    if (f.borderBox || f.stretchedV) setImp(el, 'height', f.h + 'px');
+                }
             } catch (e) {
                 // пропускаем
             }
@@ -667,9 +805,20 @@
             const r = savedFixed[i];
             if (!r || !r.el || !r.el.isConnected) continue;
             try {
-                setImp(r.el, 'zoom', String(k));
-                setImp(r.el, 'left', (r.bx - tx - (r.cx || 0)) + 'px');
-                setImp(r.el, 'top', (r.by - ty - (r.cy || 0)) + 'px');
+                if (r.nested) {
+                    // Вложенный fixed: кадр отсчёта — экран предка (он уже
+                    // с zoom=1/S). Свой zoom не ставим вовсе (1), иначе
+                    // получаем двойное сжатие: замерено 121.7 px ширины вместо
+                    // 200 и промах 328 px. left/top — от вьюпорта, как у
+                    // верхнего уровня, но без деления на S.
+                    setImp(r.el, 'zoom', '1');
+                    setImp(r.el, 'left', (r.bx - tx - (r.cx || 0)) + 'px');
+                    setImp(r.el, 'top', (r.by - ty - (r.cy || 0)) + 'px');
+                } else {
+                    setImp(r.el, 'zoom', String(k));
+                    setImp(r.el, 'left', (r.bx - tx - (r.cx || 0)) + 'px');
+                    setImp(r.el, 'top', (r.by - ty - (r.cy || 0)) + 'px');
+                }
             } catch (e) {
                 // пропускаем
             }
@@ -938,6 +1087,9 @@
 
         const sx = window.scrollX || 0;
         const sy = window.scrollY || 0;
+        // Запоминаем для цели fixed: до scrollTo(0,0) ниже.
+        entrySx = sx;
+        entrySy = sy;
 
         // Внезапный scroll-behavior: smooth у страницы сорвал бы scrollTo(0,0).
         try {
@@ -1090,6 +1242,12 @@
     // ----- Наблюдение за DOM (только пока идёт зум) -----------------------
     let observer = null;
     let observerTimer = null;
+    // MutationObserver на body НЕ видит изменений внутри shadow root —
+    // проверено (szmos3.mjs): узел, добавленный в shadow root во время зума,
+    // остался на 27.3,260.8 при цели 200,300 и с натуральным масштабом 208.9.
+    // Поэтому shadow root'ы обходятся отдельно, своим наблюдателем.
+    let shadowObservers = null;
+    let shadowSeen = new WeakSet();
     const pendingNodes = [];
     let pendingSet = new WeakSet();
     let fullRescan = false;
@@ -1099,7 +1257,18 @@
 
     function scheduleScan() {
         if (observerTimer) return;
-        observerTimer = setTimeout(scanAdded, 180);
+        // Замерено (szflash.mjs): узел, добавленный во время зума, до 11
+        // кадров жил в натуральном масштабе (l 294.9 -> 340, w 295.7 -> 180)
+        // и только потом получал компенсацию — это и видно как «элементы
+        // дёргаются». Поэтому скан идёт микрозадачей в том же кадре, ДО
+        // отрисовки: MutationObserver вызывается после текущей задачи, а
+        // отрисовка — после микрозадач.
+        observerTimer = 1;
+        if (typeof queueMicrotask === 'function') {
+            queueMicrotask(scanAdded);
+        } else {
+            setTimeout(scanAdded, 0);
+        }
     }
 
     function queueNode(n) {
@@ -1135,6 +1304,41 @@
             }
         }
         if (added) scheduleScan();
+    }
+
+    // Наблюдение за всеми открытыми shadow root'ами: MutationObserver на body
+    // изменения внутри них не видит (проверено). Хосты пересобираются на каждый
+    // вход в зум — веб-компоненты YouTube создаются и после документа.
+    function observeShadowRoots() {
+        if (typeof MutationObserver !== 'function') return;
+        if (!shadowObservers) shadowObservers = [];
+        const stack = [getSearchRoot()];
+        let guard = 0;
+        while (stack.length && guard++ < 5000) {
+            const node = stack.pop();
+            if (!node) continue;
+            let nodes;
+            try { nodes = node.querySelectorAll ? node.querySelectorAll('*') : []; }
+            catch (e) { continue; }
+            for (let i = 0; i < nodes.length; i++) {
+                const e = nodes[i];
+                let sr;
+                try { sr = e.shadowRoot; } catch (err) { sr = null; }
+                if (!sr || shadowSeen.has(sr)) continue;
+                shadowSeen.add(sr);
+                try {
+                    const mo = new MutationObserver(onMutations);
+                    mo.observe(sr, {
+                        childList: true,
+                        subtree: true,
+                        attributes: true,
+                        attributeFilter: ['class', 'style', 'hidden']
+                    });
+                    shadowObservers.push(mo);
+                } catch (err) {}
+                stack.push(sr);
+            }
+        }
     }
 
     function scanAdded() {
@@ -1227,6 +1431,7 @@
                 observer = null;
             }
         }
+        observeShadowRoots();
     }
 
     function unbindSession() {
@@ -1247,6 +1452,13 @@
             try { observer.disconnect(); } catch (e) {}
             observer = null;
         }
+        if (shadowObservers) {
+            for (let i = 0; i < shadowObservers.length; i++) {
+                try { shadowObservers[i].disconnect(); } catch (e) {}
+            }
+            shadowObservers = null;
+        }
+        shadowSeen = new WeakSet();
         if (observerTimer) {
             clearTimeout(observerTimer);
             observerTimer = null;

@@ -65,6 +65,15 @@ Elements whose containing block is not the viewport — a `fixed` node inside an
 
 `position: sticky` is intentionally not compensated: it lives in the normal flow and must grow with the page like any other content.
 
+### Sticky headers
+Sticky headers (the chip bar above a search result list, a sticky table header) are
+deliberately **not** compensated. They live in normal flow, so under the zoom they scale
+with the content around them and slide off the edges the same way ordinary text does.
+Pinning them by a one-axis offset was tried and measured: the header returned to its
+screen position but its width grew 1193 -> 1960 px at 164%, so it visibly jumped on every
+wheel step. A partially compensated element is worse than a consistent one, so sticky is
+left alone.
+
 ### Elements that appear mid-zoom
 
 A dialog, toast or dropdown that the page creates *while* you are already zoomed used to land off
