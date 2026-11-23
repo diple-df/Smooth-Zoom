@@ -1,7 +1,7 @@
 # Smooth Zoom to Cursor
 
 > Trackpad-style smooth zoom to the cursor with Ctrl+Mouse Wheel.  
-> Compositor-driven CSS transitions keep it smooth even on heavy pages. Crisp when idle, preserves fixed elements. Native Ctrl + / - zoom remains untouched.
+> One transform write per animation frame, zero work while idle. Crisp when settled, preserves fixed elements. Native Ctrl + / - zoom remains untouched.
 
 **Author:** diple_df x claude
 
@@ -48,7 +48,7 @@ Hold **Ctrl** and scroll the mouse wheel to smoothly zoom in/out to the cursor p
 ## Features
 
 - **Smooth zoom to cursor** — Zoom is anchored to your mouse position, just like trackpad pinch-to-zoom
-- **GPU-accelerated transitions** — Uses CSS transforms with compositor-driven animations for silky smoothness
+- **Frame-coalesced animation** — One `transform` write per animation frame; the loop stops when the zoom settles
 - **Works on heavy pages** — Stays responsive even on complex sites
 - **Preserves fixed elements** — Fixed elements keep their exact screen position and size at any zoom level
 - **Native zoom intact** — Ctrl + / - keyboard zoom is not affected
@@ -57,53 +57,77 @@ Hold **Ctrl** and scroll the mouse wheel to smoothly zoom in/out to the cursor p
 
 ## How It Works
 
-The script applies `transform: translate() scale()` to the document root with smooth CSS transitions and handles panning by adjusting the transform offset.
+The script applies `transform: translate() scale()` to the document root and animates the
+zoom with its own `requestAnimationFrame` loop — one transform write per frame, and the
+loop stops completely once the zoom settles. Cursor anchoring is exact: the page point
+under the cursor is recomputed on every wheel event and returned under the cursor at the
+new scale (measured drift 0 across four zoom steps in headless Edge).
 
-`position: fixed` elements do not follow an ancestor transform for their layout offset but they do obey `zoom`, so each one is pinned with `zoom: 1/scale` and repositioned as `left = target - tx`. That keeps headers, modals and floating buttons exactly where they were instead of stretching with the page, and the element's own `transform` (`translate(-50%, -50%)` centring, `scale`, rotate animations) is never overwritten.
+`position: fixed` elements get a counter-zoom `zoom: 1/scale` plus `left/top` in viewport
+coordinates, so each keeps its exact screen rect at any zoom level (measured error
+≤ 0.03 px across plain headers, `right:`/`bottom:` anchors, `inset: 0` layers and
+absolute viewport overlays). The element's own `transform` (`translate(-50%, -50%)`
+centring, `scale`, rotate animations) is never overwritten — measured on a rotating
+loader: the alternative `position: absolute` + `transform: scale(1/scale)` approach
+froze the animation and misplaced it 3.3 px.
 
-Elements whose containing block is not the viewport — a `fixed` node inside an ancestor with `transform`, `filter`, `contain` or `will-change` — are deliberately left alone, because they already scale together with that ancestor. Compensating them used to throw them up to ~780 px off screen.
+Elements whose containing block is not the viewport — a `fixed` node inside an ancestor
+with `transform`, `filter`, `contain` or `will-change` — are deliberately left alone,
+because they already scale together with that ancestor.
 
-`position: sticky` is intentionally not compensated: it lives in the normal flow and must grow with the page like any other content.
-
-### Sticky headers
-Sticky headers (the chip bar above a search result list, a sticky table header) are
-deliberately **not** compensated. They live in normal flow, so under the zoom they scale
-with the content around them and slide off the edges the same way ordinary text does.
-Pinning them by a one-axis offset was tried and measured: the header returned to its
-screen position but its width grew 1193 -> 1960 px at 164%, so it visibly jumped on every
-wheel step. A partially compensated element is worse than a consistent one, so sticky is
-left alone.
+`position: sticky` is intentionally not compensated: it lives in the normal flow and must
+grow with the page like any other content. Pinning it by a one-axis offset was tried and
+measured: the header returned to its screen position but its width grew 1193 → 1960 px at
+164%, so it visibly jumped on every wheel step. A partially compensated element is worse
+than a consistent one, so sticky is left alone.
 
 ### Elements that appear mid-zoom
 
-A dialog, toast or dropdown that the page creates *while* you are already zoomed used to land off
-screen: measured on a page zoomed to 1.39, a centred modal opened at `-251, -157` px, entirely
-outside the viewport. Its target position was being read from the already-transformed box. The target
-now comes from the element's layout coordinates, which do not depend on the zoom, so a modal opened at
-any scale appears where the page intended. Elements that existed before the zoom are unaffected —
-both numbers are identical for them.
+A dialog, toast or dropdown created *while* you are already zoomed gets the same
+compensation in the same frame: a batched MutationObserver (disconnected on exit) queues
+new nodes, and their targets are measured with the root transform temporarily removed
+inside one task, so no paint ever observes the intermediate state. Measured on a fixture
+zoomed to 164%: a late toast with `bottom: 80px` lands exactly where it would at 100%
+(676 + 44 = 720 px from the top), while without the mechanism it landed 1178 px lower.
 
 ### Web components and shadow DOM
 
-Sites built with custom elements keep their fixed headers, toasts and side panels inside a shadow root. `getElementsByTagName` does not descend into a shadow root, so those elements used to be skipped and simply scaled away with the page — measured drift of `-412, -257` px at 164%.
-
-The scan now walks every reachable open shadow root up to six levels deep and compensates those elements exactly like ordinary ones. Closed shadow roots stay invisible to any script and are skipped.
+Sites built with custom elements keep their fixed headers, toasts and side panels inside
+a shadow root. The scan walks every reachable open shadow root up to six levels deep and
+compensates those elements exactly like ordinary ones; closed shadow roots stay invisible
+to any script. A fixed element nested inside an already-compensated fixed ancestor (a
+dialog inside a full-screen popup layer) is pinned in screen coordinates without a second
+counter-zoom, because its ancestor's frame already restores the viewport.
 
 ### Fixed elements that stretch instead of staying put
 
-A fixed element stretched by `left`/`right` has no intrinsic width. Clearing `right` used to leave width on `auto`, so the browser collapsed the element to its content — a full-width header measured `1265 → 224` px. Width is now pinned in pixels for every compensated element.
+A fixed element stretched by `left`/`right` has no intrinsic width. Clearing `right` would leave width on `auto`, so the browser collapses the element to its content — a full-width header measured 1265 → 224 px. Width and height are pinned in pixels for every compensated element.
+
+### Scroll lock and scrollbar width
+
+While zoomed, the root gets `overflow: hidden` so the enlarged transform box cannot spawn
+a scrollbar loop, and `scrollbar-gutter: stable` when the page had a visible scrollbar —
+otherwise `clientWidth` would jump by the scrollbar width when the scrollbar disappears
+and the cursor anchor would drift 7.5 px on the first step. Both are restored on exit.
 
 ### Absolute overlays pinned to the viewport
 
-Not every overlay is `position:fixed`. Dialogs, modal masks, side panels and toasts are often plain `position:absolute` elements with no positioned ancestor, which makes the viewport their containing block. Under the page transform they scaled with the document: measured on DuckDuckGo, a full-screen mask grew from 1280×800 to 2103×1315 and slid to −411,−257, and a right-edge panel moved off-screen entirely.
+Not every overlay is `position:fixed`. Dialogs, modal masks, side panels and toasts are
+often plain `position:absolute` elements with no positioned ancestor, which makes the
+viewport their containing block. Under the page transform they scale with the document:
+on a fixture, a full-screen mask grew from 1280×800 and a right-edge panel slid off
+screen. They are detected (`offsetParent` is null, modulo a static body) and compensated
+with the same law as fixed elements. Measured at 164%: mask, side panel, centred modal
+and an off-screen tooltip all end at 0 px delta, while the article around them scales by
+1.643 as it should.
 
-Such an element is now detected (no positioned ancestor, and it either covers most of the viewport, touches one of its edges, or is centred in it) and compensated the same way as a fixed one. Elements that only look similar — decorative boxes positioned relative to an article — keep their parent and scale with the content, because the check requires the containing block to actually be the viewport.
+### Wheel handling at idle
 
-Measured on a fixture with four overlays at 164%: mask, side panel, centred modal and an off-screen tooltip all end at `dl = dt = dw = dh = 0`, while the article around them scales by 1.643 as it should.
-
-### Scroll lock
-
-While zoomed, the root element gets `overflow: hidden` and `scrollbar-gutter: stable`. Without that, the enlarged transform box adds area to the root's scrollable overflow. On sites that set `overflow: auto` on `<html>` — DuckDuckGo, for one — this spawns a horizontal scrollbar, which takes 15 px off `clientWidth`, which fires `resize`, which relayouts the page, which removes the scrollbar again. The result was visible flicker and content sliding off to the left. Reserving the scrollbar gutter keeps the viewport width identical before and after the zoom, so nothing reflows and the cursor anchor stays exact. Both properties are restored on zoom-out.
+The non-passive wheel listener (the only kind that can `preventDefault` a browser zoom
+gesture) does not sit on the page permanently: it would make Chrome wait on the main
+thread before every native scroll. At idle there is only a passive scout that ignores
+everything except `ctrlKey` and attaches the real listener on the first Ctrl+wheel
+event; holding Ctrl down first attaches it from `keydown`.
 
 ## Technical Details
 
@@ -140,23 +164,23 @@ Key parameters can be adjusted in the script:
 - `maxScale`: 10 (maximum zoom)
 - `wheelStep`: 0.0015 (zoom sensitivity)
 - `panSpeed`: 1 (wheel pan speed while zoomed)
-- `transitionMs`: 120 (zoom smoothing duration)
+- `transitionMs`: 120 (smoothing: the zoom approaches its target exponentially, ~120 ms to visually settle)
 - `crispDelayMs`: 200 (pause before the page is re-rasterized sharp)
 - `shiftWheelHorizontal`: false (Shift+wheel pans horizontally)
 
 ### Performance
 
-At most one `transform` write per animation frame, and effectively no work while
-idle: no animation loop, no timers, no layout reads in input handlers, and
-`will-change` is dropped as soon as the zoom settles. Measured in headless Edge:
-zero animation-frame requests during a one-second idle window.
+At most one `transform` write per animation frame, and exactly zero work while idle:
+no animation loop, no timers, no MutationObserver, no wheel listener, no layout reads.
+Measured in headless Edge: zero `requestAnimationFrame` calls during a one-second idle
+window, both at rest and while zoomed-and-settled.
 
 ### Known limitations
 
 - At the very edge of a page the cursor anchor is bounded by the pan limits
   (otherwise empty space would appear); this matches native page zoom.
-- `position: sticky` elements behave as static during zoom, because native
-  scrolling is pinned to 0 for the duration.
+- `position: sticky` elements stay in the normal flow and scale with the content
+  during zoom; their screen position is not pinned (see the sticky note above).
 - Pages that already apply `transform` or CSS `zoom` to `<html>` are left
   untouched so the script cannot corrupt their layout.
 - Wheel input over a nested scrollable element pans the zoomed page, not that

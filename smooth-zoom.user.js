@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         Smooth Zoom to Cursor
 // @namespace    https://github.com/diple-df/Smooth-Zoom
-// @version      2.16.1
-// @description  Trackpad-style smooth zoom to the cursor (Ctrl+Wheel). Compositor-driven CSS transition, at most one transform write per frame, zero work while idle. Crisp at rest, keeps fixed elements. Native Ctrl +/- left intact. Configurable via menu.
-// @description:ru Плавный зум к курсору (Ctrl+колесо). Анимация на композиторе, не больше одной записи transform за кадр, в простое скрипт не делает ничего. Чётко в покое, fixed не пропадают. Родной зум Ctrl +/- не трогается. Настраивается через меню.
+// @version      3.0.0
+// @description  Trackpad-style smooth zoom to the cursor (Ctrl+Wheel). One transform write per frame, zero work at idle. Crisp at rest, fixed elements keep their screen rect. Native Ctrl +/- left intact. Configurable via menu.
+// @description:ru Плавный зум к курсору (Ctrl+колесо). Одна запись transform за кадр, в простое скрипт не делает ничего. Чётко в покое, fixed-элементы остаются на своих местах. Родной зум Ctrl +/- не трогается. Настраивается через меню.
 // @author       diple_df x claude
 // @homepageURL  https://github.com/diple-df/Smooth-Zoom
 // @supportURL   https://github.com/diple-df/Smooth-Zoom/issues
@@ -20,21 +20,21 @@
 // @noframes
 // ==/UserScript==
 
+/*
+ * 3.0.0 — переписан с чистой архитектуры 2.7.0 (541 строка), которая работала.
+ * В 2.8.0…2.16.1 накопилось ~1000 строк особых случаев: counter-zoom-законы,
+ * scroll-lock, sticky-компенсация, обход shadow DOM, батчинг MutationObserver,
+ * детект absolute-оверлеев, naturalTargetX/Y, вложенный fixed, калибровки.
+ * Каждый случай был локально верен, но вместе они дали медленный и хрупкий
+ * скрипт. Здесь оставлен один закон на fixed-элементы и один цикл кадров.
+ *
+ * Модель: экран = translate(tx,ty) ∘ scale(S) над border-box <html> с origin 0 0.
+ * Курсор привязан точно: точка под курсором пересчитывается в локальные
+ * координаты и возвращается под курсор на новом масштабе.
+ */
+
 (function () {
     'use strict';
-
-    const HTML_NS = 'http://www.w3.org/1999/xhtml';
-    // Свойства, которые скрипт трогает у <html> и у конвертированных fixed-элементов.
-    const ROOT_PROPS = ['transform', 'transform-origin', 'will-change', 'transition', 'zoom', 'overflow', 'scrollbar-gutter'];
-    const FIXED_PROPS = ['position', 'top', 'left', 'right', 'bottom', 'width', 'height', 'margin', 'box-sizing', 'transform', 'transform-origin', 'scale', 'translate', 'zoom', 'will-change'];
-    // Контр-масштаб пишем отдельным свойством scale, а не transform: у многих
-    // элементов (центрирование translate(-50%,-50%), собственный scale,
-    // CSS-анимация вращения) transform занят, и перезапись уносила их с экрана.
-    const CAN_SCALE_PROP = (function () {
-        try {
-            return typeof CSS !== 'undefined' && !!CSS.supports && CSS.supports('scale', '0.5');
-        } catch (e) { return false; }
-    })();
 
     // ----- Настройки -----------------------------------------------------
     const DEFAULT_CFG = {
@@ -42,7 +42,7 @@
         maxScale: 10,
         wheelStep: 0.0015,
         panSpeed: 1,
-        transitionMs: 120,
+        transitionMs: 120,      // время, за которое зум «догоняет» цель
         crispDelayMs: 200,
         shiftWheelHorizontal: false,
     };
@@ -52,21 +52,19 @@
             const s = GM_getValue('smoothzoom_cfg', null);
             if (s) CONFIG = Object.assign({}, DEFAULT_CFG, JSON.parse(s));
         }
-    } catch(e) {}
+    } catch (e) {}
 
-    function saveCfg(){
+    function saveCfg() {
         try {
             if (typeof GM_setValue === 'function') GM_setValue('smoothzoom_cfg', JSON.stringify(CONFIG));
-        } catch(e){}
+        } catch (e) {}
     }
 
     // ----- Автообновление -------------------------------------------------
     // Пассивная часть — @updateURL/@downloadURL в шапке: Tampermonkey сам
-    // сверяет версию. Здесь активная: проверка по запросу из меню и раз в
-    // сутки фоном, с баннером «доступна новая версия».
-    // Скрипт висит на *://*/*, поэтому проверка обязана быть почти бесплатной:
-    // на старте читается один timestamp, сеть трогается не чаще раза в сутки
-    // и только после загрузки страницы.
+    // сверяет версию. Здесь активная: проверка из меню и раз в сутки фоном.
+    // Скрипт висит на *://*/*, поэтому в простое проверка не должна стоить
+    // ничего: читается один timestamp, сеть трогается не чаще раза в сутки.
     const UPDATE = (function () {
         const RAW = 'https://raw.githubusercontent.com/diple-df/Smooth-Zoom/main/smooth-zoom.user.js';
         const PAGE = 'https://github.com/diple-df/Smooth-Zoom';
@@ -79,10 +77,10 @@
                 if (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version)
                     return String(GM_info.script.version);
             } catch (e) {}
-            return '2.10.0';
+            return '3.0.0';
         }
 
-        // Сравнение по числовым сегментам: 2.10.0 больше 2.10.0 (строкой — нет).
+        // Сравнение по числовым сегментам: 2.10.0 больше 2.9.0 (строкой — нет).
         function cmp(a, b) {
             const pa = String(a).split(/[.\-+]/), pb = String(b).split(/[.\-+]/);
             const n = Math.max(pa.length, pb.length);
@@ -175,7 +173,6 @@
         }
 
         function menuMsg(text) {
-            // Без своего UI: короткий тост тем же баннером.
             const box = document.createElement('div');
             box.setAttribute('role', 'status');
             box.style.cssText = 'position:fixed;z-index:2147483647;right:16px;bottom:16px;' +
@@ -204,6 +201,11 @@
         GM_registerMenuCommand('Smooth Zoom: Проверить обновления', function () {
             UPDATE.check({ manual: true });
         });
+        GM_registerMenuCommand('Smooth Zoom: Сбросить настройки', function () {
+            CONFIG = Object.assign({}, DEFAULT_CFG);
+            saveCfg();
+            location.reload();
+        });
     }
 
     try {
@@ -211,57 +213,38 @@
         else window.addEventListener('load', UPDATE.maybeAuto, { once: true, passive: true });
     } catch (e) {}
 
-    if (typeof GM_registerMenuCommand === 'function') {
-        GM_registerMenuCommand('Smooth Zoom: Сбросить настройки', function(){
-            CONFIG = Object.assign({}, DEFAULT_CFG);
-            saveCfg();
-            location.reload();
-        });
-    }
-
-    // ----- Состояние -----------------------------------------------------
-    // Модель: viewport = origin + translate + scale * local,
-    // где local — координаты внутри border-box <html> при scroll 0,
-    // origin — левый верхний угол этого border-box в окне при scroll 0.
-    // Масштаб ведёт CSS transition на композиторе; главный поток пишет
-    // не больше одного transform за кадр и полностью замолкает в покое.
-    let scale = 1;                 // текущий/целевой масштаб (1 = норма)
-    let tx = 0, ty = 0;            // CSS translate в px (ровно то, что пишем)
-    let originX = 0, originY = 0;  // border-box <html> при scroll 0 (без transform)
-    let transformActive = false;
-    let root = null;
-    let savedRoot = null;          // inline-стили <html> до зума
-    let savedScrollBehavior = null;
-    let savedFixed = [];           // [{ el, style: [[prop, value, priority], ...] }]
-    let converted = new WeakSet(); // уже сконвертированные элементы (не перечитываем стили)
-    // Позиция fixed-элемента в координатах вьюпорта на масштабе 1. Нужна,
-    // чтобы пересчитывать его при каждой смене зума: без этого шапка и
-    // модальные окна уезжали за экран вместе с масштабом.
-    let captureNatural = true;     // true на входе: rect ещё не искажён transform'ом
-    let lastRepoS = -1, lastRepoTx = 0, lastRepoTy = 0;
-    let savedBodyOverflow = null;
-    // Прокрутка на входе в зум. Цель fixed-элемента задаётся в экранных
-    // координатах, а local-координаты отсчитаны от документа при scroll 0.
-    let entrySx = 0, entrySy = 0;
-    let calibratedAt = 0;          // масштаб, на котором уже калибровали fixed
+    // ----- Состояние ------------------------------------------------------
+    // cur* — то, что реально записано в DOM (цель анимации для следующего
+    // кадра). tgt* — куда едет зум. Разница между ними и есть плавность: её
+    // сглаживает один rAF-цикл, который пишет не больше одного transform за
+    // кадр и полностью останавливается, когда движение закончилось.
+    let curScale = 1, curTx = 0, curTy = 0;
+    let tgtScale = 1, tgtTx = 0, tgtTy = 0;
+    let active = false;
+    let rafId = 0;
+    let lastTs = 0;
     let willChangeOn = false;
-    let animOn = false;            // на <html> сейчас стоит анимирующий transition
-    let frameHandle = 0;
-    let lastWriteTs = 0;
-    let crispTimer = null, exitTimer = null;
-    // Кэш размеров — чтобы не читать layout в обработчиках ввода.
+    let root = null;
+    let savedRoot = null;
+    // Сконвертированные fixed/absolute-оверлеи: {el, style, bx, by, w, h}.
+    let fixed = [];
+    let converted = typeof WeakSet === 'function' ? new WeakSet() : null;
+    let observer = null;
+    let shadowObservers = [];
+    let shadowSeen = typeof WeakSet === 'function' ? new WeakSet() : null;
+    let pendingScan = [];
+    let scanAll = false;
+    // Геометрия страницы (снимается на входе, при ресайзе и при росте DOM).
     let viewW = 0, viewH = 0, baseW = 0, baseH = 0;
-    let minTx = 0, minTy = 0, maxTx = 0, maxTy = 0;
-    // Состояние, в котором реально измеряем элементы: во время анимации оно
-    // отличается от цели, поэтому читаем матрицу один раз на скан.
-    let convS = 1, convTx = 0, convTy = 0;
-    let geoDirty = true;
-    let docCheckAt = 0, docOk = true;
+
+    const TAU = Math.max(16, CONFIG.transitionMs / 2.6);
+    // Свойства, которые скрипт трогает у конвертированных элементов.
+    const FIXED_PROPS = ['zoom', 'margin', 'box-sizing', 'width', 'height', 'left', 'top'];
+    // Свойства, которые скрипт трогает у <html>.
+    const ROOT_PROPS = ['transform', 'transform-origin', 'transition', 'will-change', 'overflow', 'scrollbar-gutter'];
 
     function getRoot() {
-        if (!root || !root.isConnected) {
-            root = document.documentElement;
-        }
+        if (!root || !root.isConnected) root = document.documentElement;
         return root;
     }
 
@@ -269,7 +252,6 @@
         return Math.min(CONFIG.maxScale, Math.max(CONFIG.minScale, s));
     }
 
-    // ----- Работа с inline-стилями (сохранить/восстановить без порчи) -----
     function grabStyle(el, props) {
         const out = [];
         for (let i = 0; i < props.length; i++) {
@@ -285,9 +267,7 @@
             try {
                 if (s.v) el.style.setProperty(s.p, s.v, s.pr);
                 else el.style.removeProperty(s.p);
-            } catch (e) {
-                // пропускаем
-            }
+            } catch (e) {}
         }
     }
 
@@ -295,7 +275,7 @@
         el.style.setProperty(prop, value, 'important');
     }
 
-    // ----- Замеры (только на входе, при ресайзе и при изменениях DOM) -----
+    // Замер страницы. Только на входе/ресайзе/росте DOM — никогда в кадре.
     function measure() {
         const el = getRoot();
         viewW = (el && el.clientWidth) || window.innerWidth || 0;
@@ -304,244 +284,30 @@
         baseH = Math.max((el && el.scrollHeight) || 0, viewH);
     }
 
-    function getSearchRoot() {
-        if (document.body) return document.body;
-        if (document.documentElement) return document.documentElement;
-        return null;
-    }
-
-    // ----- Границы панорамы (только арифметика, без layout) ----------------
-    // translate играет роль -scrollX: как и нативный скролл, диапазон
-    // [-(SW*scale - VW), 0]. originX сюда не входит — он лишь сдвигает
-    // начало координат, но не увеличивает прокручиваемую область.
-    function updateBounds() {
-        maxTx = 0;
-        maxTy = 0;
-        minTx = viewW - baseW * scale;
-        minTy = viewH - baseH * scale;
-        if (minTx > maxTx) minTx = maxTx;
-        if (minTy > maxTy) minTy = maxTy;
-    }
-
+    // ----- Границы панорамы ----------------------------------------------
+    // translate играет роль -scrollX: диапазон [-(W*S - VW), 0]. Пустое поле
+    // за краем страницы не показываем, как и нативный зум.
     function clampPan() {
-        if (viewW <= 0 || viewH <= 0 || baseW <= 0 || baseH <= 0) measure();
-        updateBounds();
-        if (tx > maxTx) tx = maxTx;
-        else if (tx < minTx) tx = minTx;
-        if (ty > maxTy) ty = maxTy;
-        else if (ty < minTy) ty = minTy;
+        if (viewW <= 0 || viewH <= 0) measure();
+        const minTx = Math.min(0, viewW - baseW * tgtScale);
+        const minTy = Math.min(0, viewH - baseH * tgtScale);
+        if (tgtTx > 0) tgtTx = 0;
+        else if (tgtTx < minTx) tgtTx = minTx;
+        if (tgtTy > 0) tgtTy = 0;
+        else if (tgtTy < minTy) tgtTy = minTy;
     }
 
-    // Текущая матрица на <html>: масштаб и translate так, как их видит браузер
-    // прямо сейчас (середина анимации тоже). Нужна только на скан DOM.
-    // На входе в зум матрицы ещё нет — тогда работает пара (scale, tx/ty),
-    // которая в этот момент эквивалентна прежнему нативному скроллу.
-    function syncConv() {
-        convS = scale;
-        convTx = tx;
-        convTy = ty;
-        let m;
-        try {
-            m = getComputedStyle(getRoot()).transform;
-        } catch (e) {
-            return;
-        }
-        if (!m || m === 'none') return;
-        try {
-            if (m.indexOf('matrix3d') === 0) {
-                const p = m.slice(9, -1).split(',');
-                const s = parseFloat(p[0]), x = parseFloat(p[12]), y = parseFloat(p[13]);
-                if (isFinite(s) && s > 0) convS = s;
-                if (isFinite(x)) convTx = x;
-                if (isFinite(y)) convTy = y;
-            } else if (m.indexOf('matrix') === 0) {
-                const p = m.slice(7, -1).split(',');
-                const s = parseFloat(p[0]), x = parseFloat(p[4]), y = parseFloat(p[5]);
-                if (isFinite(s) && s > 0) convS = s;
-                if (isFinite(x)) convTx = x;
-                if (isFinite(y)) convTy = y;
-            }
-        } catch (e) {
-            // оставляем значения по умолчанию
-        }
-    }
-
-    // ----- fixed -> absolute ---------------------------------------------
-    // Один проход чтения (getComputedStyle + rect + box-sizing), затем проход
-    // записи. Иначе каждая запись вызывала бы новый style/layout пересчёт.
-    function considerNode(el, out) {
-        if (converted.has(el)) return;
-        // Вложенный fixed внутри уже сконвертированного fixed раньше
-        // пропускался целиком: считалось, что он «уже в своём контексте».
-        // Замерено на фикстуре ytlike.html: диалог в shadow root внутри
-        // #popup-container уезжал с 428.5,341 до 99.7,106.9 и сжимался
-        // 408x118 -> 248x72 (на YouTube так выглядят tp-yt-paper-dialog, меню
-        // аккаунта, тултипы плеера). Обрабатываем его отдельным режимом ниже.
-        let nestedIn = null;
-        let p = parentAcross(el);
-        while (p) {
-            if (converted.has(p)) { nestedIn = p; break; }
-            p = parentAcross(p);
-        }
-        let cs;
-        try {
-            cs = getComputedStyle(el);
-        } catch (e) {
-            return;
-        }
-        if (!cs) return;
-        const isAbs = cs.position === 'absolute';
-        // Sticky НЕ компенсируем: он остаётся в потоке и обязан
-        // масштабироваться вместе с контентом. Компенсация сдвигом
-        // возвращала top на место, но ширина росла 1193 -> 1960 при
-        // scale 1.643 (замерено на ytlike.html) — полоса «дёргалась».
-        if (cs.position !== 'fixed' && !isAbs) return;
-        // Содержащий блок не вьюпорт — элемент уже живёт в своём контексте
-        // и масштабируется вместе с ним. Замерено: попытка компенсировать
-        // такой узел давала промах до 784 px по вертикали.
-        // Вложенный в НАШ сконвертированный fixed — исключение: остановка
-        // обхода на нём, иначе наш собственный zoom предка считался бы чужим.
-        if (hasTransformAncestor(el, nestedIn || null)) return;
-        // Для absolute решение принимается ниже, когда уже есть rect.
-        let overlayAbs = false;
-        let rect;
-        try {
-            rect = el.getBoundingClientRect();
-        } catch (e) {
-            return;
-        }
-        // Скрытое поддерево (display:none): бокса нет. Не трогаем, иначе
-        // получили бы 0x0 и сломали элемент, когда его покажут. Если он
-        // появится позже, это поймает наблюдатель (класс/скрытость).
-        if (!rect.width && !rect.height) return;
-        if (isAbs) {
-            overlayAbs = isViewportOverlay(el, cs, rect);
-            if (!overlayAbs) return;
-        }
-        // transform-origin в px от левого верхнего угла border-box.
-        const toks = String(cs.transformOrigin || '').split(' ');
-        let tox = parseFloat(toks[0]), toy = parseFloat(toks[1]);
-        if (!isFinite(tox)) tox = 0;
-        if (!isFinite(toy)) toy = 0;
-        // Вклад СОБСТВЕННОГО transform элемента в его экранную позицию.
-        // Считается как разница между фактическим боксом и layout-позицией из
-        // computed left/top: для translate(-50%,-50%) это ровно -150,-80,
-        // для scale(.9) с origin center — половина разницы размеров.
-        // Без этой величины элемент с центрированием уезжает на её значение,
-        // потому что zoom не масштабирует собственный transform элемента.
-        const cl = parseFloat(cs.left), ct = parseFloat(cs.top);
-        const mx = isFinite(cl) ? rect.left - cl : 0;
-        const my = isFinite(ct) ? rect.top - ct : 0;
-        // Переводим в local-координаты: (viewport - origin - translate) / scale.
-        const inv = convS > 0 ? 1 / convS : 1;
-        // Размер для записи. rect точен, но искажается transform'ом (своим или
-        // предка) и zoom'ом. offsetWidth/offsetHeight — это layout border-box,
-        // преобразования на них не влияют, поэтому используем их как сверку:
-        // если rect с ними не сходится, берём их (с точностью до пикселя).
-        const bw = rect.width * inv;
-        const bh = rect.height * inv;
-        let w = bw, h = bh;
-        const ow = el.offsetWidth, oh = el.offsetHeight;
-        if (ow > 0 && oh > 0 &&
-            (Math.abs(ow - bw) > 1.5 || Math.abs(oh - bh) > 1.5)) {
-            w = ow;
-            h = oh;
-        }
-        out.push({
-            el: el,
-            rect: rect,
-            tox: tox,
-            toy: toy,
-            mx: mx,
-            my: my,
-            left: (rect.left - originX - convTx) * inv,
-            top: (rect.top - originY - convTy) * inv,
-            // Цель в экранных координатах для right/bottom-привязки: rect под
-            // корневым transform даёт неверный top (замерено 1449 вместо 540).
-            natLeft: naturalTargetX(el, cs, w, viewW || innerWidth),
-            natTop: naturalTargetY(el, cs, h, viewH || innerHeight),
-            w: w,
-            h: h,
-            kind: overlayAbs ? 'abs' : 'fixed',
-            // Вложенный в НАШ fixed: содержащий блок — уже сконвертированный
-            // предок, поэтому left/top считаются от его экрана, а не от
-            // вьюпорта. Второй zoom ему не нужен (родительский уже применён),
-            // достаточно zoom:1 и left = цель - tx — замерено в sznest4.mjs:
-            // 700,500 при цели 700,500 (0 px), тогда как формула «как для
-            // верхнего уровня» давала 143.3,94.1 вместо 700,500.
-            nested: !!nestedIn,
-            // Растянут сверху и снизу одновременно (inset:0, top:0;bottom:0).
-            // У таких высоту задаёт пара top/bottom, а мы её снимаем — без
-            // явного height элемент схлопнулся бы: замерено, маска ушла с
-            // 800 px до 0. Поэтому высоту для них фиксируем всегда.
-            stretchedV: cs.top !== 'auto' && cs.bottom !== 'auto',
-            borderBox: cs.boxSizing === 'border-box',
-            pl: parseFloat(cs.paddingLeft) || 0,
-            pr: parseFloat(cs.paddingRight) || 0,
-            pt: parseFloat(cs.paddingTop) || 0,
-            pb: parseFloat(cs.paddingBottom) || 0,
-            bl: parseFloat(cs.borderLeftWidth) || 0,
-            br: parseFloat(cs.borderRightWidth) || 0,
-            bt: parseFloat(cs.borderTopWidth) || 0,
-            bb: parseFloat(cs.borderBottomWidth) || 0
-        });
-    }
-
-    // Абсолютный элемент без positioned-предка (offsetParent === null) считается
-    // от initial containing block, то есть от вьюпорта: `inset:0` даёт маску на
-    // весь экран, а left:calc(100% - 302px) — панель у правого края. Под корневым
-    // transform такой оверлей масштабируется вместе с документом: маска на
-    // DDG раздувалась с 1280x800 до 2103x1315 и уезжала в -411,-257, а боковая
-    // панель уползала за правый край. Это и есть «лишние элементы при зуме».
-    // In-document декор (position:relative у предка) сюда не попадает: у него
-    // offsetParent не null.
-    let _bodyStatic = null;
-    function bodyIsStatic() {
-        if (_bodyStatic === null) {
-            try { _bodyStatic = getComputedStyle(document.body).position === 'static'; }
-            catch (e) { _bodyStatic = true; }
-        }
-        return _bodyStatic;
-    }
-
-    function isViewportOverlay(el, cs, rect) {
-        if (cs.position !== 'absolute') return false;
-        if (el === document.documentElement || el === document.body) return false;
-        // Содержащий блок — вьюпорт, если positioned-предка нет. Браузер
-        // отдаёт для такого случая offsetParent === body (а не null, как можно
-        // было бы ожидать), поэтому проверяем оба варианта. Замерено на
-        // фикстуре abs2.html: без этой поправки маска и боковая панель
-        // оставались некомпенсированными и раздувались вместе с документом.
-        const op = el.offsetParent;
-        if (op !== null && !(op === document.body && bodyIsStatic())) return false;
-        const vw = viewW > 0 ? viewW : innerWidth;
-        const vh = viewH > 0 ? viewH : innerHeight;
-        if (!vw || !vh) return false;
-        // Полноэкранная маска/подложка.
-        if (rect.width >= vw * 0.8 && rect.height >= vh * 0.8) return true;
-        // Прижата к любому краю вьюпорта: панели, доки, панели фильтров.
-        const eps = 2;
-        if (rect.left <= eps || rect.top <= eps ||
-            rect.right >= vw - eps || rect.bottom >= vh - eps) return true;
-        // Оверлей с end-привязкой (right и/или bottom) — даже если он не
-        // прижат к краю вплотную: панель DDG стоит на right:17px, top:67px,
-        // то есть в 17 px от края, и под eps=2 не попадала. Такой узел под
-        // корневым transform раздувается 302x355 -> 496x583 и уезжает на
-        // 1142.7,-147.1 (замерено, szmv.mjs). Привязка к right/bottom видна
-        // по геометрии: left+width+right ~= vw выполняется только когда
-        // элемент реально отсчитан от правого края.
-        if (anchoredToRight(el, cs, rect, vw, vh) || anchoredToBottom(el, cs, rect, vw, vh)) return true;
-        // Отцентрована по вьюпорту: диалоги и тосты с left/top:50%.
-        const cx = rect.left + rect.width / 2;
-        const cy = rect.top + rect.height / 2;
-        if (Math.abs(cx - vw / 2) <= vw * 0.03 &&
-            Math.abs(cy - vh / 2) <= vh * 0.03) return true;
-        return false;
-    }
-
-    // Предок с переходом через границу shadow root: узел внутри shadow-дерева
-    // не имеет parentElement выше хоста, поэтому цепочка обрывалась и
-    // вложенность в сконвертированный оверлей не определялась.
+    // ----- Плавный fixed: один закон на все элементы ----------------------
+    // position:fixed НЕ подчиняется transform предка, но подчиняется zoom,
+    // поэтому контр-масштаб задаётся именно zoom, а собственный transform
+    // элемента (translate(-50%,-50%), scale(.9), rotate) остаётся нетронутым:
+    // screen = tx + S*(left*zoom) = tx + left при zoom = 1/S.
+    // Замерено (mech.html, S = 1.6432 / 2.4 / 1.2): промах ≤ 0.03 px для
+    // обычного fixed, right/bottom-якоря, inset:0, absolute-оверлея и
+    // элементов со своим translate(%)/scale/rotate. Альтернатива
+    // position:absolute + transform:scale(1/S) даёт те же числа, но
+    // перезаписывает transform — на вращающемся лоадере промах 3.3 px и
+    // мёртвая анимация, поэтому отвергнута замером.
     function parentAcross(el) {
         if (el.parentElement) return el.parentElement;
         try {
@@ -551,1034 +317,592 @@
         return null;
     }
 
-    // Цель fixed-элемента в экранных координатах на масштабе 1.
-    // Прямое взятие rect.left/rect.top неверно в двух случаях, замеренных на
-    // масштабе 1.3924 (szpct.mjs, szanchor2.mjs):
-    //   right:100px;bottom:200px;150x60 честно стоит на 1015,540, а rect под
-    //   transform даёт top 1449 (промах 909 px) — bottom/right якорь;
-    //   left:50%;top:50% даёт computed top 854.5 вместо 400 (промах 454.5) —
-    //   проценты считаются от растянутого документа.
-    // Поэтому цель выводится заново: процентные и end-якоря пересчитываются от
-    // вьюпорта, пиксельные left/top берутся из computed как есть.
-    function endAnchored(el, axis) {
-        let t, e;
-        try {
-            if (axis === 'y') { t = el.style.top; e = el.style.bottom; }
-            else { t = el.style.left; e = el.style.right; }
-        } catch (err) { return false; }
-        if (t && t !== 'auto') return false;
-        return !!e && e !== 'auto';
-    }
-
-    // Признак «элемент отсчитан от правого/нижнего края вьюпорта».
-    // По computed left/right это не отличить: у CSS-класса right:17px браузер
-    // материализует и left (961px). Зато геометрия выдаёт привязку:
-    // left + width + right сходится с шириной вьюпорта.
-    // ВАЖНО: под это же условие попадает центрированный элемент
-    // (left:50%; translate(-50%,-50%)): 429+422+429 = 1280 ровно, и он
-    // получал bx=640 вместо 429 (замерено, szmodal.mjs). Поэтому
-    // самотрансформированные элементы исключаем: их вклад уже учтён в mx/my.
-    function anchoredToRight(el, cs, rect, vw) {
-        if (cs.transform && cs.transform !== 'none') return false;
-        const r = parseFloat(cs.right), l = parseFloat(cs.left);
-        if (!isFinite(r)) return false;
-        if (isFinite(l) && Math.abs(l + rect.width + r - vw) < 1.5) return true;
-        return !!(el.style.right && el.style.right !== 'auto');
-    }
-
-    function anchoredToBottom(el, cs, rect, vh) {
-        if (cs.transform && cs.transform !== 'none') return false;
-        const b = parseFloat(cs.bottom), t = parseFloat(cs.top);
-        if (!isFinite(b)) return false;
-        if (isFinite(t) && Math.abs(t + rect.height + b - vh) < 1.5) return true;
-        return !!(el.style.bottom && el.style.bottom !== 'auto');
-    }
-
-    function inlinePct(el, axis) {
-        let v;
-        try { v = axis === 'y' ? el.style.top : el.style.left; } catch (e) { return null; }
-        if (!v || v.indexOf('%') < 0) return null;
-        const n = parseFloat(v);
-        return isFinite(n) ? n : null;
-    }
-
-    function naturalTargetX(el, cs, w, vw) {
-        const pct = inlinePct(el, 'x');
-        if (pct != null) return (vw * pct) / 100;
-        if (!endAnchored(el, 'x')) return null;
-        const r = parseFloat(cs.right);
-        if (!isFinite(r)) return null;
-        return vw - r - w - (parseFloat(cs.marginLeft) || 0) - (parseFloat(cs.marginRight) || 0);
-    }
-
-    function naturalTargetY(el, cs, h, vh) {
-        const pct = inlinePct(el, 'y');
-        if (pct != null) return (vh * pct) / 100;
-        if (!endAnchored(el, 'y')) return null;
-        const b = parseFloat(cs.bottom);
-        if (!isFinite(b)) return null;
-        return vh - b - h - (parseFloat(cs.marginTop) || 0) - (parseFloat(cs.marginBottom) || 0);
-    }
-
     // position:fixed внутри предка с transform/filter/contain/will-change уже
-    // НЕ привязан к вьюпорту: его содержащий блок — этот предок. Скрипт считает
-    // left/top от вьюпорта, поэтому такой элемент уезжал на сотни пикселей
-    // (замерено: -195 px по X на тестовой странице). Такие узлы не трогаем —
-    // они корректно масштабируются вместе со своим контейнером.
-    // stopAt — предок, на котором обход прекращается (для вложенных в наш
-    // собственный fixed: он сам создаёт нужный нам кадр).
-    function hasTransformAncestor(el, stopAt) {
+    // НЕ привязан к вьюпорту: его содержащий блок — этот предок, и он корректно
+    // масштабируется вместе с ним. Замерено: fixed-шапка, вложенная в
+    // transform-контейнер, уезжала с 0,0 на 430,340. Такие узлы не трогаем.
+    function inTransformedContext(el) {
         let p = parentAcross(el);
-        while (p && p !== document.documentElement && p !== document.body && p !== stopAt) {
-            let cs2;
-            try { cs2 = getComputedStyle(p); } catch (e) { return true; }
-            if (!cs2) return true;
-            if (cs2.transform && cs2.transform !== 'none') return true;
-            if (cs2.filter && cs2.filter !== 'none') return true;
-            if (cs2.backdropFilter && cs2.backdropFilter !== 'none') return true;
-            if (cs2.perspective && cs2.perspective !== 'none') return true;
-            if (cs2.contain && /paint|layout|strict|content/i.test(cs2.contain)) return true;
-            if (cs2.willChange && /transform|perspective|filter/i.test(cs2.willChange)) return true;
+        while (p && p !== document.documentElement && p !== document.body) {
+            let cs;
+            try { cs = getComputedStyle(p); } catch (e) { return true; }
+            if (!cs) return true;
+            if (cs.transform && cs.transform !== 'none') return true;
+            if (cs.filter && cs.filter !== 'none') return true;
+            if (cs.backdropFilter && cs.backdropFilter !== 'none') return true;
+            if (cs.perspective && cs.perspective !== 'none') return true;
+            if (cs.contain && /paint|layout|strict|content/i.test(cs.contain)) return true;
+            if (cs.willChange && /transform|perspective|filter/i.test(cs.willChange)) return true;
             p = parentAcross(p);
         }
         return false;
     }
 
-    // Обход одного дерева. shadowDepth ограничивает вложенность, чтобы
-    // патологическая страница не зациклила нас на собственных пересозданиях.
-    function collectTree(root, out, shadowDepth) {        if (!root || !root.isConnected) return;
-        if (root.nodeType === 1 && (!root.namespaceURI || root.namespaceURI === HTML_NS)) {
-            considerNode(root, out);
-            if (shadowDepth < 6) collectShadow(root, out, shadowDepth);
+    let bodyStatic = null;
+    function bodyIsStatic() {
+        if (bodyStatic === null) {
+            try { bodyStatic = !document.body || getComputedStyle(document.body).position === 'static'; }
+            catch (e) { bodyStatic = true; }
         }
-        // querySelectorAll, а не getElementsByTagName: у ShadowRoot
-        // последнего нет, и обход молча обрывался на первом же компоненте.
+        return bodyStatic;
+    }
+
+    // Содержащий блок — вьюпорт? Это ровно два случая: fixed и absolute без
+    // positioned-предка. Второй под корневым transform раздувается вместе с
+    // документом: на abs2.html маска росла 1280x800 -> 2103x1315 и уезжала в
+    // -411,-257. Тот же закон zoom=1/S возвращает её на место (замерено: 0 px).
+    function isViewportPositioned(el, cs) {
+        if (cs.position === 'fixed') return true;
+        if (cs.position !== 'absolute') return false;
+        if (el === document.body || el === document.documentElement) return false;
+        const op = el.offsetParent;
+        return op === null || (op === document.body && bodyIsStatic());
+    }
+
+    // ---- Сбор кандидатов ----
+    // Элемент внутри уже сконвертированного fixed-предка получает zoom: 1,
+    // а не 1/S: кадр уже контр-масштабирован предком, второй zoom дал бы
+    // двойное сжатие (диалог в shadow root внутри #popup-container уезжал
+    // на -328, -234; с zoom=1 и замером при снятом zoom предка — точно).
+    function inConvertedContext(el) {
+        if (!converted) return null;
+        let p = parentAcross(el);
+        while (p && p !== document.documentElement && p !== document.body) {
+            if (converted.has(p)) return p;
+            p = parentAcross(p);
+        }
+        return null;
+    }
+
+    function considerNode(el, out) {
+        if (!el || el.nodeType !== 1) return;
+        if (converted && converted.has(el)) return;
+        if (el.namespaceURI && el.namespaceURI !== 'http://www.w3.org/1999/xhtml') return;
+        let cs;
+        try { cs = getComputedStyle(el); } catch (e) { return; }
+        if (!cs || !isViewportPositioned(el, cs)) return;
+        if (inTransformedContext(el)) return;
+        const nestedIn = inConvertedContext(el);
+        // Скрытое поддерево: бокса нет, не трогаем — иначе зафиксируем 0x0.
+        // Появление поймает наблюдатель (class/style/hidden) пока идёт зум.
+        let rect;
+        try { rect = el.getBoundingClientRect(); } catch (e) { return; }
+        if (!rect.width && !rect.height) return;
+        const l = parseFloat(cs.left), t = parseFloat(cs.top);
+        if (!isFinite(l) || !isFinite(t)) return;
+        // converted помечаем сразу при чтении: walk идёт в порядке документа,
+        // и вложенный fixed-потомок должен видеть предка уже сконвертированным
+        // (замерено на ytlike.html: без этого диалог получал второй zoom).
+        if (converted) converted.add(el);
+        out.push({
+            el: el,
+            style: grabStyle(el, FIXED_PROPS),
+            bx: l + (parseFloat(cs.marginLeft) || 0),
+            by: t + (parseFloat(cs.marginTop) || 0),
+            w: el.offsetWidth || rect.width,
+            h: el.offsetHeight || rect.height,
+            nested: !!nestedIn,
+        });
+    }
+
+    function walkTree(node, out, depth) {
+        if (!node || !node.isConnected) return;
+        considerNode(node, out);
+        // getElementsByTagName не видит shadow root: там живут fixed-шапки и
+        // тосты веб-компонентов, и без обхода они уезжали вместе со страницей.
+        if (depth < 6) walkShadow(node, out, depth);
         let nodes;
-        try {
-            nodes = root.querySelectorAll('*');
-        } catch (e) {
-            return;
-        }
-        for (let i = 0, len = nodes.length; i < len; i++) {
+        try { nodes = node.querySelectorAll('*'); } catch (e) { return; }
+        for (let i = 0, n = nodes.length; i < n; i++) {
             const el = nodes[i];
-            // SVG/MathML не бывают fixed — не тратим на них getComputedStyle.
-            if (el.namespaceURI && el.namespaceURI !== HTML_NS) continue;
             considerNode(el, out);
-            if (shadowDepth < 6) collectShadow(el, out, shadowDepth);
+            if (depth < 6) walkShadow(el, out, depth);
         }
     }
 
-    // getElementsByTagName не видит содержимое shadow root: веб-компоненты
-    // держат там свои fixed-шапки и тосты. Без этого прохода они просто
-    // уезжали вместе со страницей при зуме.
-    function collectShadow(host, out, shadowDepth) {
+    function walkShadow(host, out, depth) {
         let sr;
         try { sr = host.shadowRoot; } catch (e) { return; }
-        if (!sr) return; // закрытый shadow root недоступен — пропускаем
-        collectTree(sr, out, shadowDepth + 1);
+        if (!sr) return;   // закрытый shadow root недоступен никакому скрипту
+        walkTree(sr, out, depth + 1);
     }
 
-    function collectFixed(scope, out) {
-        collectTree(scope, out, 0);
+    // ---- Применение закона ----
+    // Пишется один раз при сборе (позиция при S=1 — визуально ничего не
+    // меняется) и затем каждый кадр в repoFixed(). Полный масштаб от бокса до
+    // экрана равен 1 (zoom=1/S у верхнеуровневого, zoom=1 у вложенного),
+    // поэтому собственный transform элемента даёт ровно тот же экранный
+    // сдвиг, что на масштабе 1, и трогать его не нужно.
+    function applyRecord(r) {
+        const el = r.el;
+        setImp(el, 'margin', '0');
+        setImp(el, 'box-sizing', 'border-box');
+        setImp(el, 'width', r.w + 'px');
+        setImp(el, 'height', r.h + 'px');
+        setImp(el, 'zoom', r.nested ? '1' : String(1 / curScale));
+        setImp(el, 'left', (r.bx - curTx) + 'px');
+        setImp(el, 'top', (r.by - curTy) + 'px');
+        r.s = curScale; r.x = curTx; r.y = curTy;
     }
 
-    const foundItems = [];
-
-    function applyFixed(items) {
-        const n = items.length;
-        if (!n) return;
-        // Появились новые элементы — кэш «уже пересчитано» недействителен,
-        // иначе repoFixed() не поставит им компенсацию при том же зуме.
-        lastRepoS = -1;
-        // position остаётся fixed: измерено, что fixed не подчиняется transform
-        // предка, но подчиняется zoom, поэтому именно zoom даёт точный
-        // контр-масштаб. Собственный transform элемента (translate(-50%,-50%),
-        // scale, rotate, анимации) при этом не перезаписывается — это и был
-        // корень бага «элементы прилетают мимо экрана».
-        for (let i = 0; i < n; i++) {
-            const f = items[i];
-            const el = f.el;
-            if (!el) continue;
-            try {
-                // Вложенность перепроверяем в момент записи: предок и потомок
-                // могут прийти одним батчем (YouTube вставляет поддерево
-                // целиком), и тогда при сборе предок ещё не был в converted.
-                // Обход идёт в прямом порядке, поэтому родитель уже добавлен.
-                let nestedIn = null;
-                let pp = parentAcross(el);
-                while (pp) {
-                    if (converted.has(pp)) { nestedIn = pp; break; }
-                    pp = parentAcross(pp);
-                }
-                const rec = {
-                    el: el,
-                    style: grabStyle(el, FIXED_PROPS),
-                    // Экранная позиция на масштабе 1 — цель, к которой элемент
-                    // обязан вернуться после любого зума.
-                    //
-                    // ВАЖНО: берём её из local-координат (f.left/f.top), а не
-                    // из f.rect.left. Для элементов, которые были на странице
-                    // при входе в зум, это одно и то же число. А элемент,
-                    // ПОЯВИВШИЙСЯ уже во время зума (модалка, тост, меню),
-                    // отдаёт rect, уже сдвинутый корневым transform: при
-                    // масштабе 1.39 модалка уезжала на -251,-157 px, то есть
-                    // целиком за экран. Это и есть «лишние элементы при зуме».
-                    //
-                    // Вход в зум со скроллом: local-координаты отсчитаны от
-                    // документа при scroll 0, а цель нужна в экранных. Разница
-                    // ровно на величину прокрутки на входе. Без этой поправки
-                    // ВСЕ fixed разом съезжали вниз на scrollY: замерено на
-                    // ytlike.html при scrollY=400 — шапка 0 -> 400, мини-плеер
-                    // 596 -> 996, тост 376 -> 776. На YouTube это нормальный
-                    // сценарий: прокрутил ленту и крутанул Ctrl+колесо.
-                    bx: (f.natLeft != null ? f.natLeft : (f.left + originX - (captureNatural ? entrySx : 0))),
-                    by: (f.natTop != null ? f.natTop : (f.top + originY - (captureNatural ? entrySy : 0))),
-                    // Вклад собственного transform элемента: посчитан в
-                    // considerNode() как rect.left - computed left. Оба числа
-                    // уже прочитаны, поэтому лишнего reflow нет.
-                    mx: f.mx || 0,
-                    my: f.my || 0,
-                    w: f.w,
-                    h: f.h,
-                    stretchedV: !!f.stretchedV,
-                    // Вложенный в наш fixed: его кадром отсчёта служит экран
-                    // предка, поэтому собственный zoom ему не нужен.
-                    // Пересчитывается здесь, а не берётся из f.nested: в одном
-                    // батче предок попадает в converted только теперь.
-                    nested: !!nestedIn,
-                    nestedIn: nestedIn
-                };
-                savedFixed.push(rec);
-                f.rec = rec;
-                converted.add(el);
-                // Absolute-оверлей оставляем absolute: сам containing block уже
-                // вьюпорт, менять position не нужно и вредно (fixed вырвал бы
-                // элемент из его контекста наложения). Компенсация — те же
-                // left/top/zoom, что и у fixed.
-                rec.kind = f.kind || 'fixed';
-                {
-                    // right/bottom привязки снимаем: иначе элемент, закреплённый
-                    // справа, будет расти влево и уползёт.
-                    setImp(el, 'right', 'auto');
-                    setImp(el, 'bottom', 'auto');
-                    setImp(el, 'margin', '0');
-                    // Ширину и высоту фиксируем в тех px, что были: процентные и
-                    // calc() размеры считаются от изменившегося контейнера.
-                    // Ширину фиксируем ВСЕГДА: right снят, значит ширину больше
-                    // ничто не задаёт, и auto схлопнул бы элемент по содержимому
-                    // (замерено: шапка 1265 -> 224 px). box-sizing переводим в
-                    // border-box, чтобы f.w (внешний размер) записался как есть.
-                    setImp(el, 'box-sizing', 'border-box');
-                    setImp(el, 'width', f.w + 'px');
-                    // Высоту — когда она задана явно или когда её задавала пара
-                    // top/bottom, которую мы только что сняли. У остальных
-                    // auto-высоты содержимое может вырасти, и обрезать его нельзя.
-                    if (f.borderBox || f.stretchedV) setImp(el, 'height', f.h + 'px');
-                }
-            } catch (e) {
-                // пропускаем
-            }
-        }
-        repoFixed();
-    }
-
-    // Пересчёт fixed-элементов при смене масштаба: каждый остаётся там же на
-    // экране, где был на 100%, вместо того чтобы уезжать вместе с контентом.
     function repoFixed() {
-        const n = savedFixed.length;
+        const n = fixed.length;
         if (!n) return;
-        if (lastRepoS === scale && lastRepoTx === tx && lastRepoTy === ty) return;
-        lastRepoS = scale;
-        lastRepoTx = tx;
-        lastRepoTy = ty;
-        const S = scale;
-        const k = S > 0 ? 1 / S : 1;
-        // Экранная позиция fixed-элемента под корневым
-        // translate3d(tx,ty,0) scale(S) равна  tx + S*left*zoom.
-        // При zoom = 1/S это tx + left, поэтому left = цель - tx. Один и тот же
-        // закон верен для обеих осей и не требует чтения layout в кадре:
-        // всё нужное (bx/by — цель, mx/my — вклад собственного transform) уже
-        // измерено при конвертации.
-        // Элементы со своим transform центрируются от своего origin, и их
-        // вклад не зависит от масштаба — отсюда постоянные mx/my.
+        const S = curScale, tx = curTx, ty = curTy;
+        const z = String(1 / S);
         for (let i = 0; i < n; i++) {
-            const r = savedFixed[i];
+            const r = fixed[i];
             if (!r || !r.el || !r.el.isConnected) continue;
             try {
                 if (r.nested) {
-                    // Вложенный fixed: кадр отсчёта — экран предка (он уже
-                    // с zoom=1/S). Свой zoom не ставим вовсе (1), иначе
-                    // получаем двойное сжатие: замерено 121.7 px ширины вместо
-                    // 200 и промах 328 px. left/top — от вьюпорта, как у
-                    // верхнего уровня, но без деления на S.
-                    setImp(r.el, 'zoom', '1');
-                    setImp(r.el, 'left', (r.bx - tx - (r.cx || 0)) + 'px');
-                    setImp(r.el, 'top', (r.by - ty - (r.cy || 0)) + 'px');
-                } else {
-                    setImp(r.el, 'zoom', String(k));
-                    setImp(r.el, 'left', (r.bx - tx - (r.cx || 0)) + 'px');
-                    setImp(r.el, 'top', (r.by - ty - (r.cy || 0)) + 'px');
-                }
-            } catch (e) {
-                // пропускаем
-            }
+                    if (r.s !== 1) { setImp(r.el, 'zoom', '1'); r.s = 1; }
+                } else if (r.s !== S) { setImp(r.el, 'zoom', z); r.s = S; }
+                if (r.x !== tx) { setImp(r.el, 'left', (r.bx - tx) + 'px'); r.x = tx; }
+                if (r.y !== ty) { setImp(r.el, 'top', (r.by - ty) + 'px'); r.y = ty; }
+            } catch (e) {}
         }
     }
 
-    // Остаток от собственного transform элемента (% -центрирование считает
-    // проценты от уже сжатого зумом бокса) не выводится формулой без знания
-    // внутренней арифметики браузера. Зато он практически не зависит от
-    // масштаба (проверено на 1.2…3.0), поэтому калибруется ОДИН раз при входе
-    // в зум и дальше применяется как константа. Так в кадре не остаётся ни
-    // одного замера layout.
-    function calibrateFixed() {
-        const n = savedFixed.length;
-        if (!n) return;
-        for (let i = 0; i < n; i++) {
-            const r = savedFixed[i];
+    // Принудительный возврат zoom после замера: r.s уже мог быть равен S,
+    // поэтому тихое сравнение в repoFixed() пропустило бы запись.
+    function repoFixedForceZoom() {
+        for (let i = 0; i < fixed.length; i++) {
+            const r = fixed[i];
             if (!r || !r.el || !r.el.isConnected) continue;
-            if (!r.mx && !r.my) continue;
-            for (let pass = 0; pass < 2; pass++) {
-                let rect;
-                try { rect = r.el.getBoundingClientRect(); } catch (e) { break; }
-                const ex = r.bx - rect.left;
-                const ey = r.by - rect.top;
-                if (Math.abs(ex) < 0.2 && Math.abs(ey) < 0.2) break;
-                r.cx = (r.cx || 0) - ex;
-                r.cy = (r.cy || 0) - ey;
-                try {
-                    setImp(r.el, 'left', (r.bx - tx - r.cx) + 'px');
-                    setImp(r.el, 'top', (r.by - ty - r.cy) + 'px');
-                } catch (e) { break; }
+            try {
+                setImp(r.el, 'zoom', r.nested ? '1' : String(1 / curScale));
+                r.s = curScale;
+            } catch (e) {}
+        }
+    }
+
+    // scope задан → полный скан поддерева; scope === null → только новые узлы,
+    // накопленные наблюдателем за прошедший кадр.
+    function collectFixed(scope) {
+        const q = [];
+        if (scope) {
+            q.push(scope);
+        } else {
+            for (let i = 0; i < pendingScan.length; i++) q.push(pendingScan[i]);
+        }
+        pendingScan.length = 0;
+        scanAll = false;
+        if (!q.length) return;
+
+        // Замер идёт при СНЯТЫХ transform и will-change у <html> и снятом zoom
+        // у сконвертированных элементов — каждый из них делает <html>
+        // containing block для fixed-потомков и искажает процентные цели:
+        // top:50% читался как 1134.25 вместо 450 (complex.html), late-тост
+        // bottom:80px вставал на 1898 вместо 720 (will-change), диалог в
+        // shadow root читал left 1039.32 вместо 640.5 (zoom предка, mech3).
+        // Всё происходит в одной задаче до отрисовки — кадр этого не видит.
+        const wasActive = active && curScale > 1.0001;
+        if (wasActive) {
+            try {
+                getRoot().style.setProperty('transform', 'none', 'important');
+                getRoot().style.setProperty('will-change', 'auto', 'important');
+            } catch (e) {}
+            for (let i = 0; i < fixed.length; i++) {
+                const r = fixed[i];
+                if (r && r.el && !r.nested) {
+                    try { r.el.style.setProperty('zoom', '1', 'important'); } catch (e) {}
+                }
             }
-            // После калибровки вклад собственного transform уже учтён в cx/cy.
-            r.mx = 0;
-            r.my = 0;
+        }
+        const out = [];
+        try {
+            // Сначала только чтение (getComputedStyle + rect), потом только
+            // запись: иначе каждая запись вызывала бы пересчёт стилей.
+            for (let i = 0; i < q.length; i++) walkTree(q[i], out, 0);
+        } finally {
+            if (wasActive) {
+                try {
+                    writeRoot();
+                    setImp(getRoot(), 'will-change', 'transform');
+                } catch (e) {}
+                repoFixedForceZoom();
+            }
+        }
+        if (!out.length) return;
+        for (let i = 0; i < out.length; i++) {
+            fixed.push(out[i]);
+        }
+        for (let i = 0; i < out.length; i++) {
+            try { applyRecord(out[i]); } catch (e) {}
         }
     }
 
-    function convertFixedElements() {
-        const searchRoot = getSearchRoot();
-        if (!searchRoot) return;
-        syncConv();
-        foundItems.length = 0;
-        collectFixed(searchRoot, foundItems);
-        applyFixed(foundItems);
-    }
-
-    // Калибровка вызывается только при входе в зум (один раз за сессию зума),
-    // поэтому её замеры не попадают в кадры анимации.
-    function calibrateAllFixed() {
-        calibrateFixed();
-        lastRepoS = -1;
-        repoFixed();
-        calibrateFixed();
-        lastRepoS = -1;
-    }
-
-    function restoreFixedElements() {
-        for (let i = savedFixed.length - 1; i >= 0; i--) {
-            const s = savedFixed[i];
-            if (!s || !s.el) continue;
-            putStyle(s.el, s.style);
+    function restoreFixed() {
+        for (let i = fixed.length - 1; i >= 0; i--) {
+            const r = fixed[i];
+            if (!r || !r.el) continue;
+            try { putStyle(r.el, r.style); } catch (e) {}
         }
-        savedFixed = [];
-        converted = new WeakSet();
+        fixed = [];
+        converted = typeof WeakSet === 'function' ? new WeakSet() : null;
     }
 
-    // ----- Запись transform ----------------------------------------------
-    // !important: чужой CSS не должен перебить наш transform, иначе зум
-    // молча не сработает, а скролл останется заблокированным.
-    function writeTransform() {
+    // ----- Кадр -----------------------------------------------------------
+    function writeRoot() {
         const el = getRoot();
         if (!el) return;
-        lastWriteTs = performance.now();
-        if (!willChangeOn) {
-            willChangeOn = true;
-            try { setImp(el, 'will-change', 'transform'); } catch (e) {}
-        }
         try {
             el.style.setProperty('transform',
-                'translate3d(' + tx.toFixed(2) + 'px, ' + ty.toFixed(2) + 'px, 0) scale(' +
-                scale.toFixed(4) + ')', 'important');
-        } catch (e) {
-            // игнорируем ошибки стилей
+                'translate(' + curTx + 'px, ' + curTy + 'px) scale(' + curScale + ')',
+                'important');
+        } catch (e) {}
+    }
+
+    function frame(ts) {
+        rafId = 0;
+        if (!active) return;
+        if (!lastTs) lastTs = ts;
+        const dt = Math.min(80, Math.max(4, ts - lastTs));
+        lastTs = ts;
+
+        if (scanAll) {
+            collectFixed(document.body || getRoot());
+        } else if (pendingScan.length) {
+            collectFixed(null);
+        }
+
+        const k = 1 - Math.exp(-dt / TAU);
+        curScale += (tgtScale - curScale) * k;
+        curTx += (tgtTx - curTx) * k;
+        curTy += (tgtTy - curTy) * k;
+
+        const doneS = Math.abs(tgtScale - curScale) <= 1e-5 * Math.max(1, tgtScale);
+        const doneT = Math.abs(tgtTx - curTx) <= 0.02 && Math.abs(tgtTy - curTy) <= 0.02;
+        if (doneS) curScale = tgtScale;
+        if (doneT) { curTx = tgtTx; curTy = tgtTy; }
+
+        writeRoot();
+        repoFixed();
+
+        if (doneS && doneT) {
+            settle();
+        } else {
+            rafId = requestAnimationFrame(frame);
         }
     }
 
-    // Панорама должна идти 1:1, а зум — плавно. Переключаем transition только
-    // при смене режима (не на каждом событии) и перед этим «замораживаем»
-    // фактическую матрицу, иначе незавершённый переход дёрнется в цель.
-    function freezeLive() {
-        if (!animOn) return;
-        // Свежая матрица: переключаемся на мгновенный режим ровно из видимой
-        // точки, иначе незавершённый переход дёрнулся бы в прежнюю цель.
-        syncConv();
-        if (convS > 0) {
-            scale = convS;
-            tx = convTx;
-            ty = convTy;
+    function kick() {
+        if (!active) return;
+        if (rafId) return;
+        lastTs = 0;
+        if (!willChangeOn) {
+            willChangeOn = true;
+            try { setImp(getRoot(), 'will-change', 'transform'); } catch (e) {}
         }
-        animOn = false;
-        // transition:none и запись живой матрицы — в одном пересчёте стилей,
-        // поэтому кадр не «прыгает» на прежнюю цель.
-        try { setImp(getRoot(), 'transition', 'none'); } catch (e) {}
-        writeTransform();
+        rafId = requestAnimationFrame(frame);
     }
 
-    function setTransitionAnimated() {
-        if (animOn) return;
-        animOn = true;
-        try {
-            setImp(getRoot(), 'transition', 'transform ' + CONFIG.transitionMs + 'ms ease-out');
-        } catch (e) {
-            // игнорируем
-        }
-    }
-
-    // ----- Таймеры «покой»: гасим will-change и выходим в нативное состояние
-    function armCrisp() {
-        if (crispTimer) return;
-        crispTimer = setTimeout(onCrisp, CONFIG.crispDelayMs);
-    }
-
-    function onCrisp() {
-        crispTimer = null;
-        if (!transformActive) return;
-        if (performance.now() - lastWriteTs < CONFIG.crispDelayMs) {
-            armCrisp();
-            return;
-        }
-        // Догоняем точность после того, как анимация остановилась: элементы с
-        // собственным transform нельзя вычислить формулой, но пока масштаб не
-        // меняется, один замер ничего не стоит и не попадает в кадр.
-        if (!calibratedAt || calibratedAt !== scale) {
-            calibratedAt = scale;
-            try {
-                calibrateFixed();
-            } catch (e) {
-                // игнорируем
-            }
-        }
-        // Снимаем слой и даём браузеру перерисовать страницу чётко.
+    // Движение закончилось: снимаем will-change, чтобы браузер перерисовал
+    // страницу чётко (в покое слои = замыливание). Никакого таймера не нужно:
+    // цикл кадров сам останавливается здесь же.
+    function settle() {
         if (willChangeOn) {
             willChangeOn = false;
-            try {
-                const el = getRoot();
-                // Возвращаем то, что было у страницы (обычно — ничего).
-                let prev = '';
-                if (savedRoot) {
-                    for (let i = 0; i < savedRoot.length; i++) {
-                        if (savedRoot[i].p === 'will-change') { prev = savedRoot[i].v; break; }
-                    }
-                }
-                if (prev) el.style.setProperty('will-change', prev);
-                else el.style.removeProperty('will-change');
-            } catch (e) {
-                // игнорируем
-            }
+            try { getRoot().style.removeProperty('will-change'); } catch (e) {}
         }
-    }
-
-    function armExit() {
-        if (exitTimer) return;
-        exitTimer = setTimeout(onExit, CONFIG.transitionMs + 80);
-    }
-
-    function onExit() {
-        exitTimer = null;
-        if (!transformActive) return;
-        const wait = CONFIG.transitionMs + 80;
-        if (performance.now() - lastWriteTs < wait) {
-            armExit();
-            return;
-        }
-        if (scale <= 1.0001) exitToNative();
-    }
-
-    // ----- Кадр: одна запись transform ------------------------------------
-    function scheduleFrame() {
-        if (!frameHandle) frameHandle = requestAnimationFrame(commitFrame);
-    }
-
-    function commitFrame() {
-        frameHandle = 0;
-        if (!transformActive) return;
-        if (geoDirty) {
-            geoDirty = false;
-            measure();
-            clampPan();
-        }
-        writeTransform();
-        repoFixed();
-        armCrisp();
-        if (scale <= 1.0001) armExit();
+        if (curScale <= 1.0001) exitToNative();
     }
 
     // ----- Вход/выход -----------------------------------------------------
-    // Страницы со своим transform или CSS zoom на <html> не трогаем: наш
-    // transform перезаписал бы их, и зум поехал бы относительно курсора.
-    function docCheckOk(el) {
+    function docIsClean(el) {
         let cs;
-        try {
-            cs = getComputedStyle(el);
-        } catch (e) {
-            return true;
-        }
+        try { cs = getComputedStyle(el); } catch (e) { return true; }
         if (!cs) return true;
         if (cs.transform && cs.transform !== 'none') return false;
-        const z = cs.zoom;
-        if (z && z !== 'normal' && z !== '1') {
-            const n = parseFloat(z);
-            if (isFinite(n) && n > 0) {
-                const v = z.indexOf('%') >= 0 ? n / 100 : n;
-                if (Math.abs(v - 1) > 0.001) return false;
-            }
+        if (cs.zoom && cs.zoom !== 'normal' && cs.zoom !== '1') {
+            const n = parseFloat(cs.zoom);
+            if (isFinite(n) && n > 0 && Math.abs(n - 1) > 0.001) return false;
         }
         return true;
     }
 
-    function shouldHandle() {
-        if (transformActive) return true;   // наш собственный transform не считаем чужим
-        const now = performance.now();
-        if (now - docCheckAt < 1000) return docOk;
-        docCheckAt = now;
-        docOk = docCheckOk(getRoot());
-        return docOk;
-    }
-
-    function enterTransform() {
-        if (transformActive) return;
+    function enterZoom() {
+        if (active) return false;
         const el = getRoot();
-        if (!el) return;
-        if (!shouldHandle()) return;
+        if (!el) return false;
+        // Страницу со своим transform/zoom на <html> не трогаем: наш transform
+        // перезаписал бы их и зум поехал бы не от курсора.
+        if (!docIsClean(el)) return false;
 
-        // Порядок здесь принципиален. Прокрутка корня блокируется ДО measure():
-        // иначе viewW запомнится вместе с горизонтальным скроллбаром (замерено:
-        // 1265 вместо 1280), и вся арифметика привязки к курсору сместится на
-        // половину его ширины — при первом шаге контент уезжает на ~7.5 px.
-        try { savedRoot = grabStyle(el, ROOT_PROPS); } catch (e) { savedRoot = null; }
-        // Если вертикальная полоса прокрутки занимала место, при overflow:hidden
-        // она исчезнет и страница станет шире на её ширину — замерено: clientWidth
-        // 1265 -> 1280, из-за чего привязка к курсору уезжала на 7.5 px за первый
-        // шаг. scrollbar-gutter:stable оставляет ту же полосу зарезервированной,
-        // и геометрия страницы не меняется вовсе.
+        savedRoot = grabStyle(el, ROOT_PROPS);
+
+        // Прокрутку забираем себе: translate заменяет scrollX/scrollY — как в
+        // 2.7.0: tx = -scrollX, затем scrollTo(0,0). Вид не меняется, а вся
+        // панорамная арифметика остаётся в координатах scroll=0.
+        // Порядок важен — сначала читаем прокрутку и блокируем скролл, потом
+        // меряем, иначе viewW запомнится вместе с полосой прокрутки (1265
+        // вместо 1280) и привязка к курсору сместится на половину её ширины.
+        const sx = window.scrollX || 0, sy = window.scrollY || 0;
+        try { window.scrollTo(0, 0); } catch (e) {}
+        // Полоса прокрутки при overflow:hidden исчезнет и страница станет шире
+        // на её ширину. scrollbar-gutter:stable оставляет место зарезервированным,
+        // поэтому геометрия не меняется вовсе (замерено: без него привязка
+        // уезжала на 7.5 px за первый шаг).
         try {
-            if ((window.innerWidth || 0) - (el.clientWidth || 0) > 0) {
-                setImp(el, 'scrollbar-gutter', 'stable');
-            }
-        } catch (e) {
-            // не критично
-        }
-        try {
+            if ((window.innerWidth || 0) - (el.clientWidth || 0) > 0) setImp(el, 'scrollbar-gutter', 'stable');
             setImp(el, 'overflow', 'hidden');
-        } catch (e) {
-            // не критично: останется нативный скролл
-        }
-        try {
-            const bd = document.body;
-            if (bd) {
-                savedBodyOverflow = getComputedStyle(bd).overflow;
-                setImp(bd, 'overflow', 'hidden');
-            }
-        } catch (e) {
-            savedBodyOverflow = null;
-        }
+        } catch (e) {}
 
-        const sx = window.scrollX || 0;
-        const sy = window.scrollY || 0;
-        // Запоминаем для цели fixed: до scrollTo(0,0) ниже.
-        entrySx = sx;
-        entrySy = sy;
-
-        // Внезапный scroll-behavior: smooth у страницы сорвал бы scrollTo(0,0).
-        try {
-            savedScrollBehavior = [];
-            const b = document.body;
-            savedScrollBehavior.push({ el: el, style: grabStyle(el, ['scroll-behavior']) });
-            if (b) savedScrollBehavior.push({ el: b, style: grabStyle(b, ['scroll-behavior']) });
-            el.style.setProperty('scroll-behavior', 'auto', 'important');
-            if (b) b.style.setProperty('scroll-behavior', 'auto', 'important');
-        } catch (e) {
-            savedScrollBehavior = null;
-        }
-
-        // translate играет роль -scroll: ровно столько, на сколько уедет контент.
-        scale = 1;
-        tx = -sx;
-        ty = -sy;
-
-        // origin — положение border-box <html> при scroll 0 (учитывает margin у html).
-        // Читаем до конвертации: тогда syncConv() видит состояние «страница
-        // прокручена, transform ещё нет», и local-координаты точны.
-        try {
-            const rect = el.getBoundingClientRect();
-            originX = rect.left + sx;
-            originY = rect.top + sy;
-        } catch (e) {
-            originX = 0;
-            originY = 0;
-        }
-
-        // Замер до конвертации: scrollWidth страницы, а не раздутый absolute-ами.
+        curScale = tgtScale = 1;
+        curTx = tgtTx = -sx;
+        curTy = tgtTy = -sy;
         measure();
-        // scrollWidth бывает округлён вниз; страховка, чтобы старт был в границах.
         if (baseW < viewW + sx) baseW = viewW + sx;
         if (baseH < viewH + sy) baseH = viewH + sy;
-        geoDirty = false;
 
-        try {
-            captureNatural = true;
-            convertFixedElements();
-        } catch (e) {
-            // игнорируем ошибки конвертации fixed
-        } finally {
-            captureNatural = false;
-        }
-
-        try {
-            window.scrollTo(0, 0);
-        } catch (e) {
-            // игнорируем
-        }
+        // ВАЖНО: fixed-слой снимается ДО записи transform на <html>:
+        // трансформированный <html> становится containing block для fixed
+        // потомков, и top:50% считался от документа (1134.25 вместо 450 на
+        // complex.html). Поздний сбор снимает transform сам — collectFixed.
+        try { collectFixed(document.body || el); } catch (e) {}
 
         try {
             setImp(el, 'transform-origin', '0 0');
             setImp(el, 'transition', 'none');
             setImp(el, 'will-change', 'transform');
-            // Прокрутка корня должна быть заблокирована. Причина измерена:
-            // увеличенный transform-бокс добавляет площадь в scrollable overflow,
-            // и если у <html> стоит overflow:auto (так делает DuckDuckGo и многие
-            // сайты), появляется горизонтальный скроллбар. Он отнимает 15 px у
-            // clientWidth, страница получает resize, пересобирает layout, полоса
-            // исчезает — и так по кругу. Наружу это видно как мигание и «уезжающий»
-            // контент. overflow:hidden убирает саму причину: ширина вьюпорта
-            // перестаёт меняться, а прокрутку всё равно ведёт сам скрипт.
-            // Сама блокировка ставится раньше, до measure().
             willChangeOn = true;
-        } catch (e) {
-            // не критично
-        }
+            writeRoot();
+        } catch (e) {}
 
-        transformActive = true;
-        animOn = false;
-        writeTransform();
-        // Фиксируем стартовое состояние как базу для transition: иначе браузер
-        // анимировал бы transform от identity и страница «уезжала» бы на входе.
-        try {
-            void getComputedStyle(el).transform;
-        } catch (e) {
-            // игнорируем
-        }
-        // Калибровка идёт один раз здесь, а не в кадре: элементы с собственным
-        // transform (% -центрирование) дают нелинейный остаток, который нельзя
-        // вывести формулой, но который стабилен по масштабу.
-        try {
-            calibrateAllFixed();
-        } catch (e) {
-            // игнорируем сбой калибровки: без неё элементы всё равно остаются
-            // в пределах экрана, просто с точностью до собственного transform
-        }
+        active = true;
         bindSession();
+        return true;
     }
 
     function exitToNative() {
-        if (!transformActive) {
+        if (!active) {
             detachWheel();
             return;
         }
-        const el = getRoot();
-        if (frameHandle) {
-            cancelAnimationFrame(frameHandle);
-            frameHandle = 0;
-        }
-        if (crispTimer) { clearTimeout(crispTimer); crispTimer = null; }
-        if (exitTimer) { clearTimeout(exitTimer); exitTimer = null; }
+        if (rafId) { cancelAnimationFrame(rafId); rafId = 0; }
+        active = false;
+        willChangeOn = false;
         unbindSession();
 
-        transformActive = false;
-        willChangeOn = false;
-        animOn = false;
+        // Нативный скролл туда, где видна та же картинка: scroll = -translate/S.
+        const backX = curScale > 0 ? -curTx / curScale : -curTx;
+        const backY = curScale > 0 ? -curTy / curScale : -curTy;
 
-        // Нативный скролл туда, где видна та же картинка: scroll = -translate/scale.
-        // Берём ровно то состояние, которое сами записали — без чтения стилей
-        // (неверный разбор матрицы в момент выхода сдвинул бы всю страницу).
-        const backX = scale > 0 ? -tx / scale : -tx;
-        const backY = scale > 0 ? -ty / scale : -ty;
-
-        try { restoreFixedElements(); } catch (e) {}
-
+        try { restoreFixed(); } catch (e) {}
+        const el = getRoot();
         if (savedRoot && el) putStyle(el, savedRoot);
         savedRoot = null;
-        if (savedBodyOverflow !== null) {
-            try {
-                if (document.body) document.body.style.removeProperty('overflow');
-            } catch (e) {}
-            savedBodyOverflow = null;
-        }
 
-        // Нативный скролл туда, где видна та же картинка (в том же кадре).
-        try {
-            window.scrollTo(backX, backY);
-        } catch (e) {
-            // игнорируем
-        }
-
-        if (savedScrollBehavior) {
-            for (let i = 0; i < savedScrollBehavior.length; i++) {
-                putStyle(savedScrollBehavior[i].el, savedScrollBehavior[i].style);
-            }
-            savedScrollBehavior = null;
-        }
-
-        scale = 1;
-        tx = 0;
-        ty = 0;
-        lastWriteTs = 0;
-        geoDirty = true;
+        try { window.scrollTo(backX, backY); } catch (e) {}
+        curScale = tgtScale = 1;
+        curTx = tgtTx = 0;
+        curTy = tgtTy = 0;
+        lastTs = 0;
         detachWheel();
     }
 
     // ----- Наблюдение за DOM (только пока идёт зум) -----------------------
-    let observer = null;
-    let observerTimer = null;
-    // MutationObserver на body НЕ видит изменений внутри shadow root —
-    // проверено (szmos3.mjs): узел, добавленный в shadow root во время зума,
-    // остался на 27.3,260.8 при цели 200,300 и с натуральным масштабом 208.9.
-    // Поэтому shadow root'ы обходятся отдельно, своим наблюдателем.
-    let shadowObservers = null;
-    let shadowSeen = new WeakSet();
-    const pendingNodes = [];
-    let pendingSet = new WeakSet();
-    let fullRescan = false;
-    let resizeBound = false;
-    let scrollBound = false;
-    let lifeBound = false;
-
-    function scheduleScan() {
-        if (observerTimer) return;
-        // Замерено (szflash.mjs): узел, добавленный во время зума, до 11
-        // кадров жил в натуральном масштабе (l 294.9 -> 340, w 295.7 -> 180)
-        // и только потом получал компенсацию — это и видно как «элементы
-        // дёргаются». Поэтому скан идёт микрозадачей в том же кадре, ДО
-        // отрисовки: MutationObserver вызывается после текущей задачи, а
-        // отрисовка — после микрозадач.
-        observerTimer = 1;
-        if (typeof queueMicrotask === 'function') {
-            queueMicrotask(scanAdded);
-        } else {
-            setTimeout(scanAdded, 0);
-        }
-    }
-
-    function queueNode(n) {
-        if (!n || n.nodeType !== 1) return;
-        if (pendingSet.has(n)) return;
-        if (pendingNodes.length >= 200) {
-            // Слишком много узлов: полный скан дешевле тысяч поддеревьев.
-            fullRescan = true;
-            pendingNodes.length = 0;
-            return;
-        }
-        pendingSet.add(n);
-        pendingNodes.push(n);
-    }
-
+    // Нужен, чтобы диалог/тост, созданный во время зума, получил закон в том
+    // же кадре, а не уехал вместе с документом. В простое наблюдателей нет.
     function onMutations(records) {
-        let added = false;
+        if (!active) return;
+        let any = false;
         for (let i = 0; i < records.length; i++) {
             const rec = records[i];
             if (rec.type === 'attributes') {
                 const t = rec.target;
-                // Свои записи и <html>/<body> игнорируем: это темы и состояния
-                // скролла, а полный скан body на каждое изменение — это дорого.
-                if (!t || t === root || t === document.body || converted.has(t)) continue;
-                queueNode(t);
-                added = true;
+                if (!t || t === getRoot() || t === document.body) continue;
+                if (converted && converted.has(t)) continue;
+                pendingScan.push(t);
+                any = true;
                 continue;
             }
-            const nodes = rec.addedNodes;
-            for (let j = 0; j < nodes.length; j++) {
-                queueNode(nodes[j]);
-                added = true;
+            const add = rec.addedNodes;
+            for (let j = 0; j < add.length; j++) {
+                const n = add[j];
+                if (!n || n.nodeType !== 1) continue;
+                if (pendingScan.length > 300) { scanAll = true; break; }
+                pendingScan.push(n);
+                any = true;
             }
         }
-        if (added) scheduleScan();
+        if (any) kick();
     }
 
-    // Наблюдение за всеми открытыми shadow root'ами: MutationObserver на body
-    // изменения внутри них не видит (проверено). Хосты пересобираются на каждый
-    // вход в зум — веб-компоненты YouTube создаются и после документа.
-    function observeShadowRoots() {
-        if (typeof MutationObserver !== 'function') return;
-        if (!shadowObservers) shadowObservers = [];
-        const stack = [getSearchRoot()];
-        let guard = 0;
-        while (stack.length && guard++ < 5000) {
-            const node = stack.pop();
-            if (!node) continue;
-            let nodes;
-            try { nodes = node.querySelectorAll ? node.querySelectorAll('*') : []; }
-            catch (e) { continue; }
-            for (let i = 0; i < nodes.length; i++) {
-                const e = nodes[i];
-                let sr;
-                try { sr = e.shadowRoot; } catch (err) { sr = null; }
-                if (!sr || shadowSeen.has(sr)) continue;
-                shadowSeen.add(sr);
-                try {
-                    const mo = new MutationObserver(onMutations);
-                    mo.observe(sr, {
-                        childList: true,
-                        subtree: true,
-                        attributes: true,
-                        attributeFilter: ['class', 'style', 'hidden']
-                    });
-                    shadowObservers.push(mo);
-                } catch (err) {}
-                stack.push(sr);
-            }
+    function observeShadows(scope) {
+        if (typeof MutationObserver !== 'function' || !shadowSeen) return;
+        let nodes;
+        try { nodes = scope.querySelectorAll('*'); } catch (e) { return; }
+        for (let i = 0, n = nodes.length; i < n; i++) {
+            const e = nodes[i];
+            let sr;
+            try { sr = e.shadowRoot; } catch (err) { sr = null; }
+            if (!sr || shadowSeen.has(sr)) continue;
+            shadowSeen.add(sr);
+            try {
+                const mo = new MutationObserver(onMutations);
+                mo.observe(sr, {
+                    childList: true, subtree: true,
+                    attributes: true, attributeFilter: ['class', 'style', 'hidden'],
+                });
+                shadowObservers.push(mo);
+            } catch (err) {}
+            observeShadows(sr);
         }
     }
 
-    function scanAdded() {
-        observerTimer = null;
-        if (!transformActive) {
-            pendingNodes.length = 0;
-            fullRescan = false;
-            return;
-        }
-        if (fullRescan) {
-            fullRescan = false;
-            pendingNodes.length = 0;
-            pendingSet = new WeakSet();
-            convertFixedElements();
-            refreshGeometry();
-            return;
-        }
-        syncConv();
-        foundItems.length = 0;
-        for (let i = 0; i < pendingNodes.length; i++) {
-            collectFixed(pendingNodes[i], foundItems);
-        }
-        pendingNodes.length = 0;
-        pendingSet = new WeakSet();
-        applyFixed(foundItems);
-        refreshGeometry();
-    }
-
-    // Страница могла дорасти (ленивые картинки, подгрузка ленты). Пока зум
-    // активен, обновляем границы — но пишем кадр только если размер изменился.
-    function refreshGeometry() {
-        const prevW = baseW, prevH = baseH;
-        measure();
-        if (baseW !== prevW || baseH !== prevH) {
-            clampPan();
-            scheduleFrame();
-        }
-    }
-
-    function onScrollLock() {        if (!transformActive) return;
-        // Читаем позицию: если её уже держим в нуле — никакой работы.
+    function onScrollLock() {
+        if (!active) return;
         if (!window.scrollX && !window.scrollY) return;
-        try {
-            window.scrollTo(0, 0);
-        } catch (e) {
-            // игнорируем
-        }
+        try { window.scrollTo(0, 0); } catch (e) {}
     }
 
     function onResize() {
-        if (!transformActive) return;
-        geoDirty = true;
-        scheduleFrame();
-    }
-
-    function onBeforePrint() {
-        exitToNative();
-    }
-
-    function onPageHide() {
-        exitToNative();
+        if (!active) return;
+        measure();
+        clampPan();
+        kick();
     }
 
     function bindSession() {
-        if (!resizeBound) {
-            window.addEventListener('resize', onResize, { passive: true });
-            resizeBound = true;
-        }
-        if (!scrollBound) {
-            window.addEventListener('scroll', onScrollLock, { passive: true });
-            scrollBound = true;
-        }
-        if (!lifeBound) {
-            window.addEventListener('beforeprint', onBeforePrint, { passive: true });
-            window.addEventListener('pagehide', onPageHide, { passive: true });
-            lifeBound = true;
-        }
-        if (!observer && document.body && typeof MutationObserver === 'function') {
-            try {
-                observer = new MutationObserver(onMutations);
-                // childList — новые fixed-элементы; attributes — элемент был
-                // скрыт (display:none) и его показали уже во время зума.
-                observer.observe(document.body, {
-                    childList: true,
-                    subtree: true,
-                    attributes: true,
-                    attributeFilter: ['class', 'style', 'hidden']
-                });
-            } catch (e) {
-                observer = null;
-            }
-        }
-        observeShadowRoots();
+        window.addEventListener('resize', onResize, { passive: true });
+        window.addEventListener('scroll', onScrollLock, { passive: true });
+        if (typeof MutationObserver !== 'function' || !document.body) return;
+        try {
+            observer = new MutationObserver(onMutations);
+            observer.observe(document.body, {
+                childList: true, subtree: true,
+                attributes: true, attributeFilter: ['class', 'style', 'hidden'],
+            });
+        } catch (e) { observer = null; }
+        observeShadows(document.body);
     }
 
     function unbindSession() {
-        if (resizeBound) {
-            window.removeEventListener('resize', onResize);
-            resizeBound = false;
-        }
-        if (scrollBound) {
-            window.removeEventListener('scroll', onScrollLock);
-            scrollBound = false;
-        }
-        if (lifeBound) {
-            window.removeEventListener('beforeprint', onBeforePrint);
-            window.removeEventListener('pagehide', onPageHide);
-            lifeBound = false;
-        }
+        window.removeEventListener('resize', onResize);
+        window.removeEventListener('scroll', onScrollLock);
         if (observer) {
             try { observer.disconnect(); } catch (e) {}
             observer = null;
         }
-        if (shadowObservers) {
-            for (let i = 0; i < shadowObservers.length; i++) {
-                try { shadowObservers[i].disconnect(); } catch (e) {}
-            }
-            shadowObservers = null;
+        for (let i = 0; i < shadowObservers.length; i++) {
+            try { shadowObservers[i].disconnect(); } catch (e) {}
         }
-        shadowSeen = new WeakSet();
-        if (observerTimer) {
-            clearTimeout(observerTimer);
-            observerTimer = null;
-        }
-        pendingNodes.length = 0;
-        fullRescan = false;
-        pendingSet = new WeakSet();
+        shadowObservers = [];
+        shadowSeen = typeof WeakSet === 'function' ? new WeakSet() : null;
+        pendingScan.length = 0;
+        scanAll = false;
     }
 
-    // ----- Обработчики ---------------------------------------------------
-    // Основной wheel-обработчик вешаем на весь сеанс просмотра, но он крайне
-    // дешёвый: два чтения ctrlKey/deltaY и немедленный выход. Так работает и
-    // pinch-жест тачпада (он приходит как ctrlKey:true БЕЗ нажатия Ctrl и без
-    // keydown), который отложенное подключение по клавише пропустило бы.
+    // ----- Ввод -----------------------------------------------------------
+    // Непассивный wheel-обработчик на window заставляет Chrome ждать главный
+    // поток перед каждой нативной прокруткой, поэтому в простое висит только
+    // ПАССИВНЫЙ разведчик: он ничего не отменяет и на скролл не влияет.
+    // Увидев ctrlKey (Ctrl+колесо или pinch тачпада), он в том же событии
+    // подключает рабочий обработчик на document (capture). Проверено
+    // (scout.mjs): обработчик успевает получить то же событие — первое в
+    // цепочке cancelable=false, дальше true. Реальный пользователь обычно
+    // зажимает Ctrl до колеса — тогда keydown подключает обработчик раньше.
+    let ctrlHeld = false;
+    let wheelAttached = false;
     const wheelOpts = { passive: false, capture: true };
 
     function onWheel(e) {
-        const isZoom = e.ctrlKey;
-        if (!isZoom && !transformActive) return;
         try {
-            if (isZoom) {
-                if (!shouldHandle()) return;   // страницу со своим transform/zoom не трогаем
-                // На норме и крутят «от себя»: гасим событие, но не входим в
-                // зум — иначе каждый тик конвертировал бы fixed-слой и сразу
-                // откатывал его (мигание + лишняя работа).
-                if (!transformActive && !(e.deltaY < 0)) {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    return;
-                }
+            if (e.ctrlKey) {
                 e.preventDefault();
                 e.stopPropagation();
-                if (!transformActive) {
-                    enterTransform();
-                    if (!transformActive) return;
-                }
-                // Нормализация deltaY для разных устройств (в т.ч. pinch-жестов).
                 let dy = e.deltaY;
                 if (e.deltaMode === 1) dy *= 16;
                 else if (e.deltaMode === 2) dy *= 100;
-                // Уже на нижней границе и крутят дальше «от себя»: работы нет.
-                if (scale <= 1.0001 && dy > 0) return;
-                // Считаем от целевого состояния: каждое событие умножает масштаб
-                // и заново привязывает ту же точку, поэтому серия событий за кадр
-                // складывается правильно, а в покое точка остаётся под курсором.
-                const ux = e.clientX - originX;
-                const uy = e.clientY - originY;
-                const localX = (ux - tx) / scale;
-                const localY = (uy - ty) / scale;
+                // На норме крутят «от себя»: гасим событие, но НЕ входим в
+                // зум. Проверка ДО enterZoom: иначе очередной «от себя» после
+                // выхода снова входил в зум и оставлял страницу в режиме
+                // scale=1 (замерено на szv16: transform matrix(1,0,0,1,0,0)
+                // после выхода, will-change и overflow не сняты).
+                if (!active && dy >= 0) return;
+                if (!active && !enterZoom()) return;
+                // У нижней границы и крутят «от себя»: работы нет.
+                if (tgtScale <= 1.0001 && dy > 0) return;
+                // Считаем от цели, а не от записанного: несколько событий за                // кадр складываются правильно, и точка остаётся под курсором.
+                const lx = (e.clientX - tgtTx) / tgtScale;
+                const ly = (e.clientY - tgtTy) / tgtScale;
                 let k = 1 - dy * CONFIG.wheelStep;
-                if (!(k > 0.15)) k = 0.15;    // защита от гигантских дельт
+                if (!(k > 0.15)) k = 0.15;
                 else if (k > 4) k = 4;
-                let next = clampScale(scale * k);
-                // У самой нижней границы фиксируем ровно 1: иначе остаётся
-                // доля процента, из-за которой выход в нативную прокрутку
-                // сдвинул бы страницу на доли пикселя.
+                let next = clampScale(tgtScale * k);
                 if (next <= 1.0001) next = CONFIG.minScale;
-                scale = next;
-                // Возвращаем ту же точку под курсор.
-                tx = ux - localX * scale;
-                ty = uy - localY * scale;
+                tgtScale = next;
+                tgtTx = e.clientX - lx * tgtScale;
+                tgtTy = e.clientY - ly * tgtScale;
                 clampPan();
-                setTransitionAnimated();
-                scheduleFrame();
+                kick();
                 return;
             }
-            // ----- Прокрутка по увеличенной странице -----
-            // Уже на норме: отдаём событие нативному скроллу и сразу выходим.
-            if (scale <= 1.0001) {
-                exitToNative();
-                return;
-            }
+            if (!active) return;
+            // Прокрутка по увеличенной странице: 1:1, без сглаживания.
+            if (curScale <= 1.0001) { exitToNative(); return; }
             e.preventDefault();
             e.stopPropagation();
-            // Панорама 1:1: фиксируем живую матрицу и идём без анимации.
-            freezeLive();
-            let dx = e.deltaX;
-            let dy = e.deltaY;
-            if (e.deltaMode === 1) {
-                dx *= 16;
-                dy *= 16;
-            } else if (e.deltaMode === 2) {
-                dx *= viewW || 800;
-                dy *= viewH || 600;
-            }
+            let dx = e.deltaX, dy = e.deltaY;
+            if (e.deltaMode === 1) { dx *= 16; dy *= 16; }
+            else if (e.deltaMode === 2) { dx *= viewW || 800; dy *= viewH || 600; }
             if ((e.shiftKey && CONFIG.shiftWheelHorizontal) ||
                 (e.shiftKey && Math.abs(dx) < 0.0001)) {
-                tx -= dy * CONFIG.panSpeed;
+                tgtTx -= dy * CONFIG.panSpeed;
             } else {
-                tx -= dx * CONFIG.panSpeed;
-                ty -= dy * CONFIG.panSpeed;
+                tgtTx -= dx * CONFIG.panSpeed;
+                tgtTy -= dy * CONFIG.panSpeed;
             }
             clampPan();
-            scheduleFrame();
-        } catch (err) {
-            // Безопасный выход при ошибках
-        }
+            curTx = tgtTx;
+            curTy = tgtTy;
+            kick();
+        } catch (err) {}
+    }
+
+    // Пассивный разведчик. На обычный скролл работы ноль: одна проверка ctrlKey.
+    function scout(e) {
+        if (e.ctrlKey) attachWheel();
     }
 
     function attachWheel() {
+        if (wheelAttached) return;
         try {
-            window.addEventListener('wheel', onWheel, wheelOpts);
-        } catch (e) {
-            // игнорируем
-        }
+            document.addEventListener('wheel', onWheel, wheelOpts);
+            wheelAttached = true;
+        } catch (e) {}
     }
 
     function detachWheel() {
-        // Обработчик постоянный (см. attachWheel внизу): его не нужно
-        // переподключать на каждый keydown, и он ловит pinch-жест.
+        if (!wheelAttached || ctrlHeld || active) return;
+        try { document.removeEventListener('wheel', onWheel, wheelOpts); } catch (e) {}
+        wheelAttached = false;
     }
 
-    // Ctrl+колесо и pinch — оба приходят как wheel с ctrlKey. Один постоянный
-    // обработчик дешевле, чем переподключение на каждый keydown, и он не
-    // пропускает pinch. При обычной прокрутке он выходит за одну проверку.
-    attachWheel();
+    window.addEventListener('wheel', scout, { passive: true, capture: true });
 
-    window.addEventListener('blur', function () {
-        // Потеря фокуса не должна оставлять страницу в зум-режиме.
-        if (transformActive) exitToNative();
+    window.addEventListener('keydown', function (e) {
+        if (e.ctrlKey || e.key === 'Control') {
+            ctrlHeld = true;
+            attachWheel();
+        }
     }, { passive: true });
 
+    window.addEventListener('keyup', function (e) {
+        if (!e.ctrlKey || e.key === 'Control') {
+            ctrlHeld = false;
+            detachWheel();
+        }
+    }, { passive: true });
+
+    window.addEventListener('blur', function () {
+        ctrlHeld = false;
+        if (active) exitToNative();
+        else detachWheel();
+    });
+
+    window.addEventListener('pagehide', function () {
+        if (active) exitToNative();
+    }, { passive: true });
 })();
